@@ -1,0 +1,21 @@
+env:
+  # Example parameters for CloseAirCombat 2v2.
+  # Update keys to match CloseAirCombat's actual make_env signature.
+  scenario: "2v2"
+  max_steps: 1000
+  seed: 0
+
+algorithm:
+  # Example CLAM hyperparameters. Update to match CLAM-RL class signature.
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  gamma: 0.99
+  tau: 0.005
+  batch_size: 256
+  buffer_size: 1000000
+
+training:
+  # Example training loop parameters consumed by CLAM's train() method.
+  total_steps: 2000000
+  log_interval: 10000
+  eval_interval: 50000
