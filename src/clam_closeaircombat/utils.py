@@ -7,7 +7,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
 
 
 class IntegrationError(RuntimeError):
@@ -57,6 +56,12 @@ def load_config_file(path: str | None) -> dict[str, Any]:
     if not config_path.exists():
         raise IntegrationError(f"Config file not found: {config_path}")
     if config_path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ModuleNotFoundError as exc:
+            raise IntegrationError(
+                "PyYAML is required to read YAML configs. Install it or use JSON."
+            ) from exc
         return yaml.safe_load(config_path.read_text()) or {}
     if config_path.suffix.lower() == ".json":
         return json.loads(config_path.read_text())
@@ -77,4 +82,9 @@ def merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, An
 
 def dump_config(config: Any, path: Path) -> None:
     payload = asdict(config) if hasattr(config, "__dataclass_fields__") else config
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        path.write_text(json.dumps(payload, indent=2))
+        return
     path.write_text(yaml.safe_dump(payload, sort_keys=False))

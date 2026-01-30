@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Integration scaffolding for CloseAirCombat 2v2 + CLAM-RL"
 requires-python = ">=3.10"
 dependencies = [
+  "gymnasium",
+  "numpy",
   "PyYAML",
+  "torch",
 ]
 
 [project.scripts]
