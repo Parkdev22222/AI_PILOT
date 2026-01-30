@@ -1,9 +1,9 @@
 env_entry: closeaircombat.envs:make_2v2_env
-clam_entry: clam_rl.trainers.clam_trainer:CLAMTrainer
+clam_entry: clam_closeaircombat.clam_trainer:CLAMTrainer
 total_steps: 500000
 seed: 42
 log_dir: runs/clam_closeaircombat
 env_kwargs:
-  scenario: 2v2
+  config_name: 2v2/NoWeapon/HierarchySelfplay
 clam_kwargs:
   device: cuda

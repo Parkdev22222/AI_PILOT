@@ -32,7 +32,7 @@ export CLAM_RL_PATH="$(pwd)/external/CLAM-RL"
 ```bash
 python scripts/train_clam_2v2.py \
   --env-entry "closeaircombat.envs:make_2v2_env" \
-  --clam-entry "clam_rl.trainers.clam_trainer:CLAMTrainer" \
+  --clam-entry "clam_closeaircombat.clam_trainer:CLAMTrainer" \
   --total-steps 500000
 ```
 
@@ -42,14 +42,12 @@ python scripts/train_clam_2v2.py \
 
 ### 참고
 - `--env-entry`는 `module_path:callable_name` 형식입니다.
-- 예: `CloseAirCombat.envs.JSBSim.envs.multiplecombat_env:MultipleCombatEnv`처럼
-  레포 이름으로 시작하는 모듈 경로도 사용할 수 있도록 `sys.path`에 레포 부모 경로를 추가합니다.
-  예를 들어 CloseAirCombat이 `external/CloseAirCombat`에 있다면
-  `external`이 자동으로 `sys.path`에 포함되어 위 모듈 경로가 임포트됩니다.
-- `--clam-entry`는 CLAM-RL에서 **실제 trainer/agent 클래스**의 경로로 교체해야 합니다.
-  예: `clam_rl.trainers.clam_trainer:CLAMTrainer` 또는
-  `clam_rl.agents.clam_agent:CLAMAgent` (프로젝트 구조에 맞게 조정)
-- 위 entry는 예시이며, 실제 모듈/클래스 경로는 두 레포의 구조에 맞게 변경하세요.
+- 기본 예시는 `closeaircombat.envs:make_2v2_env`이며, 내부에서 JSBSim 환경을 생성하고
+  CLAM이 사용할 수 있도록 **MultiDiscrete 액션을 단일 Discrete로 펼치는 어댑터**를 적용합니다.
+  `env_kwargs.config_name`으로 `2v2/NoWeapon/HierarchySelfplay` 같은 JSBSim config 이름을 지정할 수 있습니다.
+- `--clam-entry`는 CLAM 트레이너 클래스 경로이며, 기본 제공되는
+  `clam_closeaircombat.clam_trainer:CLAMTrainer`는 CLAM-RL의 PPO+FNN 모델을 사용해
+  CloseAirCombat 환경에서 학습하도록 구성되어 있습니다.
 
 ## 4) 추가 설정
 
@@ -75,7 +73,10 @@ python scripts/train_clam_2v2.py --config configs/clam_closeaircombat.yaml
 ./src/clam_closeaircombat/
   env_adapter.py
   clam_adapter.py
+  clam_trainer.py
   config.py
   runner.py
   utils.py
+./src/closeaircombat/
+  envs.py
 ```
