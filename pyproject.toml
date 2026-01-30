@@ -1,0 +1,15 @@
+[project]
+name = "clam-closeaircombat"
+version = "0.1.0"
+description = "Integration scaffolding for CloseAirCombat 2v2 + CLAM-RL"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML",
+]
+
+[project.scripts]
+train-clam-2v2 = "clam_closeaircombat.runner:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
