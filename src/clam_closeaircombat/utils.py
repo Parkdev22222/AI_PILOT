@@ -36,7 +36,8 @@ def load_entrypoint(entry: str) -> Callable[..., Any]:
         module = importlib.import_module(module_name)
     except Exception as exc:  # pragma: no cover - explicit error reporting
         raise IntegrationError(
-            f"Failed to import module '{module_name}' for entry '{entry}'."
+            "Failed to import module "
+            f"'{module_name}' for entry '{entry}': {exc}"
         ) from exc
     try:
         target = getattr(module, attr)

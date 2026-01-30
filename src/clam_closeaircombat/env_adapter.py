@@ -28,4 +28,6 @@ def make_env(entry: str, repo_path: Path, env_kwargs: dict[str, Any]) -> Any:
             f"Failed to create env via '{entry}'. Check env_kwargs: {env_kwargs}."
         ) from exc
     except Exception as exc:
-        raise IntegrationError(f"Env creation failed via '{entry}'.") from exc
+        raise IntegrationError(
+            f"Env creation failed via '{entry}': {exc}"
+        ) from exc

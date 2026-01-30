@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-import numpy as np
-from gymnasium import spaces
-
 
 @dataclass(frozen=True)
 class FlatActionSpec:
@@ -24,7 +21,9 @@ class FlatActionSpec:
             index = index * base + int(value)
         return index
 
-    def unflatten(self, index: int) -> np.ndarray:
+    def unflatten(self, index: int):
+        import numpy as np
+
         values = []
         remaining = int(index)
         for base in reversed(self.nvec):
@@ -37,6 +36,8 @@ class CloseAirCombatAdapter:
     """Adapter to expose CloseAirCombat envs with MPE-style interfaces."""
 
     def __init__(self, env: Any, flatten_actions: bool = True):
+        from gymnasium import spaces
+
         self.env = env
         self.flatten_actions = flatten_actions
         if not hasattr(env, "num_agents"):
@@ -80,13 +81,17 @@ class CloseAirCombatAdapter:
     def close(self):
         return self.env.close()
 
-    def _split(self, data: np.ndarray | Sequence[Any]):
+    def _split(self, data: Any):
+        import numpy as np
+
         array = np.asarray(data)
         if array.shape[0] != self.n:
             return list(data)
         return [array[idx] for idx in range(self.n)]
 
-    def _build_action_spec(self, space: spaces.Space) -> FlatActionSpec:
+    def _build_action_spec(self, space: Any) -> FlatActionSpec:
+        from gymnasium import spaces
+
         if isinstance(space, spaces.MultiDiscrete):
             return FlatActionSpec(tuple(int(value) for value in space.nvec))
         if isinstance(space, spaces.Tuple):
