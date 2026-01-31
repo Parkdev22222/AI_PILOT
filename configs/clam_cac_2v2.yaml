@@ -1,0 +1,22 @@
+# Example config for training CLAM on CloseAirCombat 2v2.
+# Update the entrypoints to match the actual modules in your repos.
+
+env:
+  entrypoint: "close_air_combat.envs:make_2v2_env"
+  kwargs:
+    scenario: "2v2"
+    render: false
+
+clam:
+  entrypoint: "clam.algorithms.clam:CLAMTrainer"
+  kwargs:
+    # Add CLAM-specific hyperparameters here.
+    # Example:
+    # lr: 3.0e-4
+    # batch_size: 1024
+
+train:
+  total_steps: 500000
+  log_dir: "runs/clam_cac_2v2"
+  seed: 1
+  device: "cuda"
