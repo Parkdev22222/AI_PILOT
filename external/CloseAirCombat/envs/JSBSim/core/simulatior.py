@@ -86,6 +86,90 @@ class BaseSimulator(ABC):
         logging.debug(f"{self.__class__.__name__}:{self.uid} is deleted!")
 
 
+
+
+class RadarSimulator:
+    """Simple pulse-doppler radar model for an aircraft host."""
+
+    def __init__(self,
+                 host: 'AircraftSimulator',
+                 carrier_frequency_hz: float = 10e9,
+                 max_range_m: float = 50000.0,
+                 fov_deg: float = 120.0):
+        self.host = host
+        self.carrier_frequency_hz = carrier_frequency_hz
+        self.max_range_m = max_range_m
+        self.fov_deg = fov_deg
+        self.c0 = 299792458.0
+        self.wavelength_m = self.c0 / self.carrier_frequency_hz
+        self.detections = []
+        self.search_az_center_rad = 0.0
+        self.search_el_center_rad = 0.0
+        self.search_range_m = self.max_range_m
+
+    def reset(self):
+        self.detections = []
+        self.search_az_center_rad = 0.0
+        self.search_el_center_rad = 0.0
+        self.search_range_m = self.max_range_m
+
+    def set_search_command(self, az_center_rad: float = 0.0, el_center_rad: float = 0.0, range_m: float = None):
+        self.search_az_center_rad = float(az_center_rad)
+        self.search_el_center_rad = float(el_center_rad)
+        if range_m is None:
+            self.search_range_m = self.max_range_m
+        else:
+            self.search_range_m = float(np.clip(range_m, 1000.0, self.max_range_m))
+
+    def scan(self, targets: List[BaseSimulator]):
+        host_pos = self.host.get_position()
+        host_vel = self.host.get_velocity()
+        host_yaw = self.host.get_rpy()[2]
+        host_forward = np.array([np.cos(host_yaw), np.sin(host_yaw), 0.0], dtype=np.float64)
+
+        detections = []
+        for tgt in targets:
+            if tgt.uid == self.host.uid:
+                continue
+            # ignore dead targets if status exists
+            if hasattr(tgt, 'is_alive') and not tgt.is_alive:
+                continue
+
+            rel_pos = np.array(tgt.get_position() - host_pos, dtype=np.float64)
+            rng = np.linalg.norm(rel_pos)
+            if rng < 1e-6 or rng > self.search_range_m:
+                continue
+
+            azimuth = np.arctan2(rel_pos[1], rel_pos[0]) - host_yaw
+            azimuth = (azimuth + np.pi) % (2 * np.pi) - np.pi
+            elevation = np.arctan2(rel_pos[2], np.linalg.norm(rel_pos[:2]))
+
+            az_err = (azimuth - self.search_az_center_rad + np.pi) % (2 * np.pi) - np.pi
+            el_err = elevation - self.search_el_center_rad
+            half_fov_rad = np.deg2rad(self.fov_deg / 2)
+            if abs(az_err) > half_fov_rad or abs(el_err) > half_fov_rad:
+                continue
+
+            los_u = rel_pos / rng
+            rel_vel = np.array(tgt.get_velocity() - host_vel, dtype=np.float64)
+            radial_velocity = np.dot(rel_vel, los_u)
+            # monostatic radar Doppler: fd = -2 * vr / lambda
+            doppler_hz = -2.0 * radial_velocity / self.wavelength_m
+
+            detections.append({
+                'host_id': self.host.uid,
+                'target_id': tgt.uid,
+                'range_m': float(rng),
+                'azimuth_rad': float(azimuth),
+                'elevation_rad': float(elevation),
+                'radial_velocity_mps': float(radial_velocity),
+                'doppler_hz': float(doppler_hz),
+                'carrier_frequency_hz': float(self.carrier_frequency_hz),
+                'wavelength_m': float(self.wavelength_m),
+            })
+        self.detections = detections
+        return detections
+
 class AircraftSimulator(BaseSimulator):
     """A class which wraps an instance of JSBSim and manages communication with it.
     """
@@ -129,6 +213,7 @@ class AircraftSimulator(BaseSimulator):
         self.launch_missiles = []   # type: List[MissileSimulator]
         self.under_missiles = []    # type: List[MissileSimulator]
         # initialize simulator
+        self.radar = RadarSimulator(self)
         self.reload()
 
     @property
@@ -160,6 +245,7 @@ class AircraftSimulator(BaseSimulator):
         self.launch_missiles.clear()
         self.under_missiles.clear()
         self.num_left_missiles = self.num_missiles
+        self.radar.reset()
 
         # load JSBSim FDM
         self.jsbsim_exec = jsbsim.FGFDMExec(os.path.join(get_root_dir(), 'data'))
@@ -317,6 +403,15 @@ class AircraftSimulator(BaseSimulator):
                     prop.update(self)
         else:
             raise ValueError(f"prop type unhandled: {type(prop)} ({prop})")
+
+    def update_radar(self, targets: List[BaseSimulator]):
+        return self.radar.scan(targets)
+
+    def set_radar_command(self, az_center_rad: float = 0.0, el_center_rad: float = 0.0, range_m: float = None):
+        self.radar.set_search_command(az_center_rad, el_center_rad, range_m)
+
+    def get_radar_detections(self):
+        return self.radar.detections
 
     def check_missile_warning(self):
         for missile in self.under_missiles:
