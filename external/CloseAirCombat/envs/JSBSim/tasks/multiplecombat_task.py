@@ -250,6 +250,41 @@ class HierarchicalMultipleCombatShootTask(HierarchicalMultipleCombatTask):
         self._shoot_action[agent_id] = action[3] > 0
         return super().normalize_action(env, agent_id, action[:3])
 
+
+    def mask_action(self, env, agent_id, action):
+        """Mask action for 2v2 shoot task using missile approach direction only.
+
+        Input contract: (altitude, heading, velocity, missile_flag)
+        """
+        action_arr = np.array(action, copy=True)
+        if action_arr.shape[-1] < 4:
+            return action_arr
+
+        flight_action = action_arr[:3].copy()
+        missile_flag = action_arr[3:4].copy()
+
+        missile_sim = env.agents[agent_id].check_missile_warning()
+        if missile_sim is None or not missile_sim.is_alive:
+            return action_arr
+
+        ego_vel = np.array(env.agents[agent_id].get_velocity()[:2], dtype=np.float64)
+        missile_vel = np.array(missile_sim.get_velocity()[:2], dtype=np.float64)
+        if np.linalg.norm(ego_vel) < 1e-6 or np.linalg.norm(missile_vel) < 1e-6:
+            # keep missile flag, force max speed only
+            flight_action[2] = 0
+            return np.concatenate([flight_action, missile_flag], axis=-1)
+
+        ego_heading = np.arctan2(ego_vel[1], ego_vel[0])
+        missile_heading = np.arctan2(missile_vel[1], missile_vel[0])
+        perp_headings = [missile_heading + np.pi / 2, missile_heading - np.pi / 2]
+        target_heading = min(perp_headings, key=lambda h: abs((h - ego_heading + np.pi) % (2 * np.pi) - np.pi))
+        turn_left = ((target_heading - ego_heading + np.pi) % (2 * np.pi) - np.pi) > 0
+
+        # enforce max speed and strong heading turn by missile approach direction only
+        flight_action[2] = 0
+        flight_action[1] = 0 if turn_left else 4
+        return np.concatenate([flight_action, missile_flag], axis=-1)
+
     def step(self, env):
         SingleCombatTask.step(self, env)
         for agent_id, agent in env.agents.items():
