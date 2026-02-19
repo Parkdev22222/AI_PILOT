@@ -28,22 +28,14 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         self.observation_space = spaces.Box(low=-10, high=10., shape=(21,))
 
     def load_action_space(self):
-        # flight control(4) + radar search command(3)
-        # radar: azimuth_bin[0~40], elevation_bin[0~30], range_bin[0~40]
-        self.action_space = spaces.MultiDiscrete([41, 41, 41, 30, 41, 31, 41])
+        # high-level control + shoot flag
+        self.action_space = spaces.MultiDiscrete([3, 5, 3, 2])
 
     def normalize_action(self, env, agent_id, action):
         action = np.asarray(action)
-        flight_action = action[:4].astype(np.int32)
-        radar_cmd = action[4:7].astype(np.int32) if action.shape[-1] >= 7 else np.array([20, 15, 40], dtype=np.int32)
-
-        # radar search command mapping
-        az_center = (radar_cmd[0] - 20) / 20 * np.pi
-        el_center = (radar_cmd[1] - 15) / 15 * (np.pi / 3)
-        range_m = 5000 + radar_cmd[2] / 40 * 45000
-        env.agents[agent_id].set_radar_command(az_center, el_center, range_m)
-
-        return SingleCombatTask.normalize_action(self, env, agent_id, flight_action)
+        # [altitude, heading, velocity, shoot_flag] -> use first 3 for control
+        flight_action = action[:3].astype(np.int32)
+        return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, flight_action)
 
     def get_obs(self, env, agent_id):
         """
@@ -127,99 +119,93 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         return super().reset(env)
 
     def mask_action(self, env, agent_id, action):
-        action_arr = np.array(action, copy=True)
+        """Mask high-level action [altitude, heading, velocity, shoot_flag].
 
-        if action_arr.shape[-1] >= 7:
-            flight_action = action_arr[:4].copy()
-            radar_action = action_arr[4:7].copy()
-            mode = 'low_with_radar'
-        elif action_arr.shape[-1] >= 6:
-            flight_action = action_arr[:3].copy()
-            radar_action = action_arr[3:6].copy()
-            mode = 'high_with_radar'
-        elif action_arr.shape[-1] == 4:
-            flight_action = action_arr.copy()
-            radar_action = None
-            mode = 'low'
-        elif action_arr.shape[-1] == 3:
-            flight_action = action_arr.copy()
-            radar_action = None
-            mode = 'high'
-        else:
+        - No missile warning:
+            1) If enemy is outside ego-heading based up/down/left/right 45° sectors,
+               force action to bring enemy into one of these sectors.
+            2) If enemy is already inside one of these sectors,
+               allow maneuver only for the enemy-direction sector.
+        - Missile warning:
+            keep existing missile-evasion behavior (left/right strong turn + max speed).
+        """
+        action_arr = np.array(action, copy=True)
+        if action_arr.shape[-1] < 4:
             return action_arr
 
-        def _pack(flight_masked):
-            if radar_action is None:
-                return flight_masked
-            return np.concatenate([flight_masked, radar_action], axis=-1)
+        # Input contract from user: [altitude, heading, velocity, shoot_flag]
+        flight_action = action_arr[:3].copy()
+        shoot_flag = action_arr[3:4].copy()
+
+        def _pack(masked_flight_action):
+            return np.concatenate([masked_flight_action, shoot_flag], axis=-1)
 
         def _apply_max_speed(masked_flight_action):
-            if masked_flight_action.shape[-1] == 4:
-                masked_flight_action[3] = 29
-            elif masked_flight_action.shape[-1] == 3:
-                masked_flight_action[2] = 0
+            # high-level velocity index: 0 => accelerate
+            masked_flight_action[2] = 0
             return masked_flight_action
 
-        def _choose_turn_by_missile(ego_vel_xy, missile_vel_xy):
-            missile_speed = np.linalg.norm(missile_vel_xy)
-            ego_heading = np.arctan2(ego_vel_xy[1], ego_vel_xy[0])
-            missile_heading = np.arctan2(missile_vel_xy[1], missile_vel_xy[0])
-            perp_headings = [missile_heading + np.pi / 2, missile_heading - np.pi / 2]
-            target_heading = min(perp_headings, key=lambda h: abs(in_range_rad(h - ego_heading)))
-            return in_range_rad(target_heading - ego_heading) > 0, missile_speed
+        def _closest_sector(azimuth, elevation, th):
+            candidates = {
+                'left': abs(in_range_rad(azimuth - np.pi / 2)),
+                'right': abs(in_range_rad(azimuth + np.pi / 2)),
+                'up': abs(elevation - np.pi / 2),
+                'down': abs(elevation + np.pi / 2),
+            }
+            return min(candidates, key=candidates.get)
 
         missile_sim = env.agents[agent_id].check_missile_warning()
         if missile_sim is None or not missile_sim.is_alive:
             enemies = [enemy for enemy in env.agents[agent_id].enemies if enemy.is_alive]
             if not enemies:
                 return _pack(flight_action)
+
             ego_position = env.agents[agent_id].get_position()
             closest_enemy = min(enemies, key=lambda enemy: np.linalg.norm(enemy.get_position() - ego_position))
-            target_vector = closest_enemy.get_position() - ego_position
+            rel = closest_enemy.get_position() - ego_position
+
             ego_velocity = env.agents[agent_id].get_velocity()
             ego_heading = np.arctan2(ego_velocity[1], ego_velocity[0])
-
-            rel_xy = np.array(target_vector[:2], dtype=np.float64)
-            rel_dist_xy = np.linalg.norm(rel_xy)
-            if rel_dist_xy < 1e-6:
+            rel_xy = np.array(rel[:2], dtype=np.float64)
+            rel_xy_norm = np.linalg.norm(rel_xy)
+            if rel_xy_norm < 1e-6:
                 return _pack(flight_action)
 
             rel_heading = np.arctan2(rel_xy[1], rel_xy[0])
             azimuth = in_range_rad(rel_heading - ego_heading)
-            elevation = np.arctan2(target_vector[2], rel_dist_xy)
-            sector_th = np.deg2rad(45.0)
+            elevation = np.arctan2(rel[2], rel_xy_norm)
+            th = np.deg2rad(45.0)
 
-            inside_sector = (abs(azimuth) >= sector_th) or (abs(elevation) >= sector_th)
-            dominant_vertical = abs(elevation) >= abs(azimuth)
-            if dominant_vertical:
-                enemy_sector = 'up' if elevation >= 0 else 'down'
+            in_left = abs(in_range_rad(azimuth - np.pi / 2)) <= th
+            in_right = abs(in_range_rad(azimuth + np.pi / 2)) <= th
+            in_up = abs(elevation - np.pi / 2) <= th
+            in_down = abs(elevation + np.pi / 2) <= th
+            inside_any = in_left or in_right or in_up or in_down
+
+            if inside_any:
+                if in_left:
+                    sector = 'left'
+                elif in_right:
+                    sector = 'right'
+                elif in_up:
+                    sector = 'up'
+                else:
+                    sector = 'down'
             else:
-                enemy_sector = 'left' if azimuth >= 0 else 'right'
-            target_sector = enemy_sector if inside_sector else enemy_sector
+                sector = _closest_sector(azimuth, elevation, th)
 
             masked = flight_action.copy()
-            if masked.shape[-1] == 4:
-                if target_sector == 'left':
-                    masked[0] = 0
-                    masked[2] = 0
-                elif target_sector == 'right':
-                    masked[0] = 40
-                    masked[2] = 40
-                elif target_sector == 'up':
-                    masked[1] = 40
-                else:
-                    masked[1] = 0
-            elif masked.shape[-1] == 3:
-                if target_sector == 'left':
-                    masked[1] = 0
-                elif target_sector == 'right':
-                    masked[1] = 4
-                elif target_sector == 'up':
-                    masked[0] = 0
-                else:
-                    masked[0] = 2
+            if sector == 'left':
+                masked[1] = 0            # heading left extreme
+            elif sector == 'right':
+                masked[1] = 4            # heading right extreme
+            elif sector == 'up':
+                masked[0] = 0            # altitude up command
+            else:  # down
+                masked[0] = 2            # altitude down command
             return _pack(masked)
 
+        # Missile warning branch (kept behavior): max speed + perpendicular turn direction.
         ego_velocity = env.agents[agent_id].get_velocity()
         missile_velocity = missile_sim.get_velocity()
         ego_xy = np.array(ego_velocity[:2], dtype=np.float64)
@@ -228,42 +214,14 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         if np.linalg.norm(ego_xy) < 1e-6 or np.linalg.norm(missile_xy) < 1e-6:
             return _pack(_apply_max_speed(flight_action.copy()))
 
-        turn_left, missile_speed = _choose_turn_by_missile(ego_xy, missile_xy)
-
-        candidate_actions = np.array([
-            [0, 34, 0, 29],
-            [6, 30, 6, 29],
-            [20, 24, 20, 29],
-            [34, 30, 34, 29],
-            [40, 34, 40, 29],
-            [10, 38, 10, 29],
-            [30, 38, 30, 29],
-        ], dtype=np.int32)
-        masked_indices = [3, 4] if turn_left else [0, 1]
-
-        treat_as_score = (
-            flight_action.ndim == 1 and flight_action.shape[0] == candidate_actions.shape[0]
-            and np.issubdtype(flight_action.dtype, np.floating)
-            and np.all(flight_action >= 0)
-            and np.isclose(np.sum(flight_action), 1.0, atol=1e-2)
-        )
-        if treat_as_score:
-            scores = flight_action.astype(np.float64)
-            scores[masked_indices] = -np.inf
-            selected = candidate_actions[int(np.argmax(scores))].copy()
-            if missile_speed >= 600:
-                selected[1] = min(40, selected[1] + 2)
-            return _pack(selected)
+        ego_heading = np.arctan2(ego_xy[1], ego_xy[0])
+        missile_heading = np.arctan2(missile_xy[1], missile_xy[0])
+        perp_headings = [missile_heading + np.pi / 2, missile_heading - np.pi / 2]
+        target_heading = min(perp_headings, key=lambda h: abs(in_range_rad(h - ego_heading)))
+        turn_left = in_range_rad(target_heading - ego_heading) > 0
 
         masked = _apply_max_speed(flight_action.copy())
-        if masked.shape[-1] == 4:
-            turn_index = 0 if turn_left else 40
-            masked[0] = turn_index
-            masked[2] = turn_index
-            if missile_speed >= 600:
-                masked[1] = 40
-        elif masked.shape[-1] == 3:
-            masked[1] = 0 if turn_left else 4
+        masked[1] = 0 if turn_left else 4
         return _pack(masked)
 
     def step(self, env):
@@ -303,8 +261,8 @@ class HierarchicalSingleCombatDodgeMissileTask(HierarchicalSingleCombatTask, Sin
         return SingleCombatDodgeMissileTask.load_observation_space(self)
 
     def load_action_space(self):
-        # high-level flight(3) + radar search command(3)
-        self.action_space = spaces.MultiDiscrete([3, 5, 3, 41, 31, 41])
+        # high-level control + shoot flag
+        self.action_space = spaces.MultiDiscrete([3, 5, 3, 2])
 
     def get_obs(self, env, agent_id):
         return SingleCombatDodgeMissileTask.get_obs(self, env, agent_id)
@@ -312,13 +270,6 @@ class HierarchicalSingleCombatDodgeMissileTask(HierarchicalSingleCombatTask, Sin
     def normalize_action(self, env, agent_id, action):
         action = np.asarray(action)
         flight_action = action[:3].astype(np.int32)
-        radar_cmd = action[3:6].astype(np.int32) if action.shape[-1] >= 6 else np.array([20, 15, 40], dtype=np.int32)
-
-        az_center = (radar_cmd[0] - 20) / 20 * np.pi
-        el_center = (radar_cmd[1] - 15) / 15 * (np.pi / 3)
-        range_m = 5000 + radar_cmd[2] / 40 * 45000
-        env.agents[agent_id].set_radar_command(az_center, el_center, range_m)
-
         return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, flight_action)
 
     def reset(self, env):
@@ -344,22 +295,14 @@ class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
         self.observation_space = spaces.Box(low=-10, high=10., shape=(21,))
 
     def load_action_space(self):
-        # flight control(4) + radar search command(3)
-        # radar: azimuth_bin[0~40], elevation_bin[0~30], range_bin[0~40]
-        self.action_space = spaces.MultiDiscrete([41, 41, 41, 30, 41, 31, 41])
+        # high-level control + shoot flag
+        self.action_space = spaces.MultiDiscrete([3, 5, 3, 2])
 
     def normalize_action(self, env, agent_id, action):
         action = np.asarray(action)
-        flight_action = action[:4].astype(np.int32)
-        radar_cmd = action[4:7].astype(np.int32) if action.shape[-1] >= 7 else np.array([20, 15, 40], dtype=np.int32)
-
-        # radar search command mapping
-        az_center = (radar_cmd[0] - 20) / 20 * np.pi
-        el_center = (radar_cmd[1] - 15) / 15 * (np.pi / 3)
-        range_m = 5000 + radar_cmd[2] / 40 * 45000
-        env.agents[agent_id].set_radar_command(az_center, el_center, range_m)
-
-        return SingleCombatTask.normalize_action(self, env, agent_id, flight_action)
+        # [altitude, heading, velocity, shoot_flag] -> use first 3 for control
+        flight_action = action[:3].astype(np.int32)
+        return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, flight_action)
 
     def load_action_space(self):
         # aileron, elevator, rudder, throttle, shoot control
