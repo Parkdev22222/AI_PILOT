@@ -121,19 +121,18 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
     def mask_action(self, env, agent_id, action):
         """Mask high-level action [altitude, heading, velocity, shoot_flag].
 
-        - No missile warning:
-            1) If enemy is outside ego-heading based up/down/left/right 45° sectors,
-               force action to bring enemy into one of these sectors.
-            2) If enemy is already inside one of these sectors,
-               allow maneuver only for the enemy-direction sector.
-        - Missile warning:
-            keep existing missile-evasion behavior (left/right strong turn + max speed).
+        Action semantics (discrete):
+            - altitude: 0 (down), 1 (hold), 2 (up)
+            - heading: 0 (left) ... 4 (right)
+            - velocity: 0 (min) ... 2 (max)
+
+        Missile warning branch uses missile direction/speed to induce a
+        perpendicular break turn so missile turn-demand/energy loss increases.
         """
         action_arr = np.array(action, copy=True)
         if action_arr.shape[-1] < 4:
             return action_arr
 
-        # Input contract from user: [altitude, heading, velocity, shoot_flag]
         flight_action = action_arr[:3].copy()
         shoot_flag = action_arr[3:4].copy()
 
@@ -141,87 +140,52 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
             return np.concatenate([masked_flight_action, shoot_flag], axis=-1)
 
         def _apply_max_speed(masked_flight_action):
-            # high-level velocity index: 0 => accelerate
-            masked_flight_action[2] = 0
+            # velocity index semantics: 2 == max speed
+            masked_flight_action[2] = 2
             return masked_flight_action
-
-        def _closest_sector(azimuth, elevation, th):
-            candidates = {
-                'left': abs(in_range_rad(azimuth - np.pi / 2)),
-                'right': abs(in_range_rad(azimuth + np.pi / 2)),
-                'up': abs(elevation - np.pi / 2),
-                'down': abs(elevation + np.pi / 2),
-            }
-            return min(candidates, key=candidates.get)
 
         missile_sim = env.agents[agent_id].check_missile_warning()
         if missile_sim is None or not missile_sim.is_alive:
-            enemies = [enemy for enemy in env.agents[agent_id].enemies if enemy.is_alive]
-            if not enemies:
-                return _pack(flight_action)
+            # If no incoming missile warning, do not override policy action.
+            return _pack(flight_action)
 
-            ego_position = env.agents[agent_id].get_position()
-            closest_enemy = min(enemies, key=lambda enemy: np.linalg.norm(enemy.get_position() - ego_position))
-            rel = closest_enemy.get_position() - ego_position
+        ego_velocity = np.array(env.agents[agent_id].get_velocity(), dtype=np.float64)
+        missile_velocity = np.array(missile_sim.get_velocity(), dtype=np.float64)
 
-            ego_velocity = env.agents[agent_id].get_velocity()
-            ego_heading = np.arctan2(ego_velocity[1], ego_velocity[0])
-            rel_xy = np.array(rel[:2], dtype=np.float64)
-            rel_xy_norm = np.linalg.norm(rel_xy)
-            if rel_xy_norm < 1e-6:
-                return _pack(flight_action)
-
-            rel_heading = np.arctan2(rel_xy[1], rel_xy[0])
-            azimuth = in_range_rad(rel_heading - ego_heading)
-            elevation = np.arctan2(rel[2], rel_xy_norm)
-            th = np.deg2rad(45.0)
-
-            in_left = abs(in_range_rad(azimuth - np.pi / 2)) <= th
-            in_right = abs(in_range_rad(azimuth + np.pi / 2)) <= th
-            in_up = abs(elevation - np.pi / 2) <= th
-            in_down = abs(elevation + np.pi / 2) <= th
-            inside_any = in_left or in_right or in_up or in_down
-
-            if inside_any:
-                if in_left:
-                    sector = 'left'
-                elif in_right:
-                    sector = 'right'
-                elif in_up:
-                    sector = 'up'
-                else:
-                    sector = 'down'
-            else:
-                sector = _closest_sector(azimuth, elevation, th)
-
-            masked = flight_action.copy()
-            if sector == 'left':
-                masked[1] = 0            # heading left extreme
-            elif sector == 'right':
-                masked[1] = 4            # heading right extreme
-            elif sector == 'up':
-                masked[0] = 0            # altitude up command
-            else:  # down
-                masked[0] = 2            # altitude down command
-            return _pack(masked)
-
-        # Missile warning branch (kept behavior): max speed + perpendicular turn direction.
-        ego_velocity = env.agents[agent_id].get_velocity()
-        missile_velocity = missile_sim.get_velocity()
-        ego_xy = np.array(ego_velocity[:2], dtype=np.float64)
-        missile_xy = np.array(missile_velocity[:2], dtype=np.float64)
-
-        if np.linalg.norm(ego_xy) < 1e-6 or np.linalg.norm(missile_xy) < 1e-6:
-            return _pack(_apply_max_speed(flight_action.copy()))
-
-        ego_heading = np.arctan2(ego_xy[1], ego_xy[0])
-        missile_heading = np.arctan2(missile_xy[1], missile_xy[0])
-        perp_headings = [missile_heading + np.pi / 2, missile_heading - np.pi / 2]
-        target_heading = min(perp_headings, key=lambda h: abs(in_range_rad(h - ego_heading)))
-        turn_left = in_range_rad(target_heading - ego_heading) > 0
+        ego_xy = ego_velocity[:2]
+        missile_xy = missile_velocity[:2]
+        missile_speed = np.linalg.norm(missile_velocity)
 
         masked = _apply_max_speed(flight_action.copy())
+
+        # Degenerate case: missile direction unavailable -> keep max speed only.
+        if np.linalg.norm(missile_xy) < 1e-6:
+            return _pack(masked)
+
+        # Choose a perpendicular heading (left/right) against missile approach direction.
+        ego_heading = np.arctan2(ego_xy[1], ego_xy[0]) if np.linalg.norm(ego_xy) > 1e-6 else 0.0
+        missile_heading = np.arctan2(missile_xy[1], missile_xy[0])
+        candidate_left = missile_heading + np.pi / 2
+        candidate_right = missile_heading - np.pi / 2
+
+        left_delta = abs(in_range_rad(candidate_left - ego_heading))
+        right_delta = abs(in_range_rad(candidate_right - ego_heading))
+        turn_left = left_delta <= right_delta
         masked[1] = 0 if turn_left else 4
+
+        # Missile speed-aware vertical break: faster missile -> stronger vertical split.
+        if missile_speed >= 350.0:
+            # If missile is climbing toward us, break down; if diving, break up.
+            missile_vz = missile_velocity[2]
+            if missile_vz > 0:
+                masked[0] = 0
+            elif missile_vz < 0:
+                masked[0] = 2
+            else:
+                masked[0] = 0 if turn_left else 2
+        else:
+            masked[0] = 1
+
         return _pack(masked)
 
     def step(self, env):
