@@ -173,8 +173,14 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
             elevation = np.arctan2(rel_vec[2], rel_xy_norm)
 
             masked = flight_action.copy()
-            # Turn toward enemy bearing.
-            masked[1] = 0 if azimuth > 0 else 4
+            # If enemy is behind (|azimuth| > 90 deg), force one-direction break turn
+            # so enemy can be brought to the front hemisphere.
+            if abs(azimuth) > np.pi / 2:
+                masked[1] = 4  # always turn right when enemy is behind
+            else:
+                # Enemy is in front hemisphere: turn toward enemy bearing.
+                masked[1] = 0 if azimuth > 0 else 4
+
             # Climb/descend toward enemy altitude if vertical offset is meaningful.
             if elevation > np.deg2rad(5.0):
                 masked[0] = 2
