@@ -16,11 +16,15 @@ def _t2n(x):
 class ShareJSBSimRunner(Runner):
 
     def _action_masking(self, obs, actions):
-        """Missile-aware action masking to force energy-draining missile turns.
+        """Missile-turn-maximizing masking for [altitude, heading, velocity, missile_launch].
 
-        Expected action format: [altitude, heading, velocity, missile_flag].
-        Observation uses the last missile feature block:
-            [rel_speed, rel_alt, AO, TA, distance_norm, side_flag].
+        Discrete action semantics:
+            altitude: 0(down), 1(hold), 2(up)
+            heading:  0(left) ... 4(right)
+            velocity: 0(low), 1(mid), 2(max)
+        We use incoming-missile direction/speed cues from the missile block in obs
+        to force perpendicular evasive turns and high speed so the missile expends
+        more turn energy.
         """
         masked_actions = actions.copy()
         for env_idx in range(masked_actions.shape[0]):
@@ -31,20 +35,22 @@ class ShareJSBSimRunner(Runner):
                 missile_distance_norm = float(missile_feat[4])
                 missile_side_flag = float(missile_feat[5])
 
-                # no missile warning in observation -> skip masking
+                # No missile warning in this obs block.
                 if abs(missile_rel_speed) < 1e-6 and abs(missile_distance_norm) < 1e-6 and abs(missile_side_flag) < 1e-6:
                     continue
 
-                # Always command max speed to increase separation and force missile turning
-                masked_actions[env_idx, agent_idx, 2] = 0
+                # Force maximum ownship speed: velocity index 2.
+                masked_actions[env_idx, agent_idx, 2] = 2
 
-                # Break toward the opposite side of missile LOS to maximize required missile turn
-                turn_left = missile_side_flag >= 0
+                # Make missile turn harder: break opposite to missile side.
+                turn_left = missile_side_flag >= 0.0
                 masked_actions[env_idx, agent_idx, 1] = 0 if turn_left else 4
 
-                # Closer/faster missile -> stronger vertical maneuver
+                # If missile is relatively fast/close, add vertical split-S/barrel tendency.
                 if missile_distance_norm <= 0.25 or missile_rel_speed >= 0.3:
                     masked_actions[env_idx, agent_idx, 0] = 0 if turn_left else 2
+                else:
+                    masked_actions[env_idx, agent_idx, 0] = 1
 
         return masked_actions
 

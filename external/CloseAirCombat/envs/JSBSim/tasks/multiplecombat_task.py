@@ -271,7 +271,7 @@ class HierarchicalMultipleCombatShootTask(HierarchicalMultipleCombatTask):
         missile_vel = np.array(missile_sim.get_velocity()[:2], dtype=np.float64)
         if np.linalg.norm(ego_vel) < 1e-6 or np.linalg.norm(missile_vel) < 1e-6:
             # keep missile flag, force max speed only
-            flight_action[2] = 0
+            flight_action[2] = 2
             return np.concatenate([flight_action, missile_flag], axis=-1)
 
         ego_heading = np.arctan2(ego_vel[1], ego_vel[0])
@@ -281,7 +281,7 @@ class HierarchicalMultipleCombatShootTask(HierarchicalMultipleCombatTask):
         turn_left = ((target_heading - ego_heading + np.pi) % (2 * np.pi) - np.pi) > 0
 
         # enforce max speed and strong heading turn by missile approach direction only
-        flight_action[2] = 0
+        flight_action[2] = 2
         flight_action[1] = 0 if turn_left else 4
         return np.concatenate([flight_action, missile_flag], axis=-1)
 
