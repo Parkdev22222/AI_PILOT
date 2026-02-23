@@ -146,8 +146,42 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
 
         missile_sim = env.agents[agent_id].check_missile_warning()
         if missile_sim is None or not missile_sim.is_alive:
-            # If no incoming missile warning, do not override policy action.
-            return _pack(flight_action)
+            # No missile warning: steer toward the nearest alive enemy until 10 km.
+            enemies = [enemy for enemy in env.agents[agent_id].enemies if enemy.is_alive]
+            if not enemies:
+                return _pack(flight_action)
+
+            ego_pos = np.array(env.agents[agent_id].get_position(), dtype=np.float64)
+            closest_enemy = min(enemies, key=lambda enemy: np.linalg.norm(np.array(enemy.get_position(), dtype=np.float64) - ego_pos))
+            rel_vec = np.array(closest_enemy.get_position(), dtype=np.float64) - ego_pos
+            rel_distance = np.linalg.norm(rel_vec)
+
+            # Already close enough: keep policy action.
+            if rel_distance <= 10000.0:
+                return _pack(flight_action)
+
+            rel_xy = rel_vec[:2]
+            rel_xy_norm = np.linalg.norm(rel_xy)
+            if rel_xy_norm < 1e-6:
+                return _pack(flight_action)
+
+            ego_vel = np.array(env.agents[agent_id].get_velocity(), dtype=np.float64)
+            ego_xy = ego_vel[:2]
+            ego_heading = np.arctan2(ego_xy[1], ego_xy[0]) if np.linalg.norm(ego_xy) > 1e-6 else 0.0
+            enemy_heading = np.arctan2(rel_xy[1], rel_xy[0])
+            azimuth = in_range_rad(enemy_heading - ego_heading)
+            elevation = np.arctan2(rel_vec[2], rel_xy_norm)
+
+            masked = flight_action.copy()
+            # Turn toward enemy bearing.
+            masked[1] = 0 if azimuth > 0 else 4
+            # Climb/descend toward enemy altitude if vertical offset is meaningful.
+            if elevation > np.deg2rad(5.0):
+                masked[0] = 2
+            elif elevation < -np.deg2rad(5.0):
+                masked[0] = 0
+            # Keep current velocity command from policy.
+            return _pack(masked)
 
         ego_velocity = np.array(env.agents[agent_id].get_velocity(), dtype=np.float64)
         missile_velocity = np.array(missile_sim.get_velocity(), dtype=np.float64)
