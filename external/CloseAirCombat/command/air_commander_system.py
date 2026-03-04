@@ -13,7 +13,7 @@ from .commander_db import CommanderCombatDB
 @dataclass
 class BaseState:
     name: str
-    position_km: Tuple[float, float]
+    lon_lat: Tuple[float, float]
     ready_fighters: int
 
 
@@ -21,7 +21,7 @@ class BaseState:
 class AirTrack:
     track_id: str
     side: str
-    position_km: np.ndarray
+    lon_lat: np.ndarray
     heading_rad: float
     speed_kmph: float = 2000.0
     is_shotdown: bool = False
@@ -30,9 +30,15 @@ class AirTrack:
     def step(self, dt_hours: float):
         if self.is_shotdown:
             return
-        dx = self.speed_kmph * math.cos(self.heading_rad) * dt_hours
-        dy = self.speed_kmph * math.sin(self.heading_rad) * dt_hours
-        self.position_km = self.position_km + np.array([dx, dy], dtype=np.float64)
+        distance_km = self.speed_kmph * dt_hours
+        east_km = distance_km * math.cos(self.heading_rad)
+        north_km = distance_km * math.sin(self.heading_rad)
+
+        lat = float(self.lon_lat[1])
+        dlat = north_km / 111.0
+        dlon = east_km / max(111.0 * math.cos(math.radians(lat)), 1e-6)
+
+        self.lon_lat = self.lon_lat + np.array([dlon, dlat], dtype=np.float64)
 
 
 @dataclass
@@ -108,11 +114,11 @@ class KoreaAirCommanderSystem:
         self.engagements: Dict[str, Engagement] = {}
         self.global_step = 0
 
-    def add_enemy_wave(self, track_id: str, start_km: Tuple[float, float], heading_rad: float):
+    def add_enemy_wave(self, track_id: str, start_lon_lat: Tuple[float, float], heading_rad: float):
         self.enemy_tracks[track_id] = AirTrack(
             track_id=track_id,
             side="enemy",
-            position_km=np.array(start_km, dtype=np.float64),
+            lon_lat=np.array(start_lon_lat, dtype=np.float64),
             heading_rad=heading_rad,
         )
 
@@ -128,12 +134,13 @@ class KoreaAirCommanderSystem:
         self._launch_interceptors()
         self._activate_engagements_if_needed()
         self._step_active_engagements()
+        self._log_live_tracks()
 
     def _launch_interceptors(self):
         for enemy in self.enemy_tracks.values():
             if enemy.is_shotdown:
                 continue
-            nearest_base = self._nearest_available_base(enemy.position_km)
+            nearest_base = self._nearest_available_base(enemy.lon_lat)
             if nearest_base is None:
                 continue
             if self._has_assigned_friendly(enemy.track_id):
@@ -141,7 +148,7 @@ class KoreaAirCommanderSystem:
 
             prompt = (
                 "한반도 전역 상황을 바탕으로 적기 남하 경로를 고려해 출격 기지를 선택하라. "
-                f"적기={enemy.track_id}, 위치={enemy.position_km.tolist()}, 후보기지={list(self.bases.keys())}"
+                f"적기={enemy.track_id}, 위치={enemy.lon_lat.tolist()}, 후보기지={list(self.bases.keys())}"
             )
             commander_answer = self.commander.decide_scramble(prompt)
             self.db.log_event(
@@ -153,12 +160,13 @@ class KoreaAirCommanderSystem:
 
             base = nearest_base
             base.ready_fighters -= 1
-            heading = math.atan2(enemy.position_km[1] - base.position_km[1], enemy.position_km[0] - base.position_km[0])
+            vec = enemy.lon_lat - np.array(base.lon_lat, dtype=np.float64)
+            heading = math.atan2(vec[1], vec[0])
             fid = f"F_{base.name}_{enemy.track_id}"
             self.friendly_tracks[fid] = AirTrack(
                 track_id=fid,
                 side="ally",
-                position_km=np.array(base.position_km, dtype=np.float64),
+                lon_lat=np.array(base.lon_lat, dtype=np.float64),
                 heading_rad=heading,
             )
 
@@ -169,7 +177,7 @@ class KoreaAirCommanderSystem:
             enemy = self._paired_enemy(fid)
             if enemy is None or enemy.is_shotdown:
                 continue
-            dist_km = float(np.linalg.norm(friendly.position_km - enemy.position_km))
+            dist_km = self._haversine_km(tuple(friendly.lon_lat), tuple(enemy.lon_lat))
             if dist_km > 40.0:
                 continue
 
@@ -177,7 +185,8 @@ class KoreaAirCommanderSystem:
             if env_id in self.engagements:
                 continue
 
-            region = self._region_name((friendly.position_km + enemy.position_km) / 2.0)
+            midpoint = (friendly.lon_lat + enemy.lon_lat) / 2.0
+            region = self._region_name(midpoint)
             os.environ.setdefault("CLOSEAIRCOMBAT_TELEMETRY_DB", self.db.db_path)
             env = MultipleCombatEnv(self.scenario_name)
             env.reset()
@@ -195,7 +204,7 @@ class KoreaAirCommanderSystem:
         for env_id, engagement in list(self.engagements.items()):
             env = engagement.env
             action = np.zeros((env.num_agents, 4), dtype=np.int64)
-            obs, share_obs, rewards, dones, info = env.step(action)
+            _, _, _, dones, info = env.step(action)
             battle_snapshot = info.get("battle_snapshot", {"allies": [], "enemies": []})
             self.db.log_engagement_snapshot(
                 run_id=self.run_id,
@@ -204,7 +213,6 @@ class KoreaAirCommanderSystem:
                 region=engagement.region,
                 snapshot=battle_snapshot,
             )
-
             self._handle_events_with_llm(env_id, engagement.region, battle_snapshot)
 
             if np.all(np.array(dones).squeeze(-1)):
@@ -218,6 +226,42 @@ class KoreaAirCommanderSystem:
                 )
                 env.close()
                 del self.engagements[env_id]
+
+    def _log_live_tracks(self):
+        engaged_pairs = {}
+        for env_id, engagement in self.engagements.items():
+            for a in engagement.allies:
+                engaged_pairs[a.track_id] = (env_id, engagement.region)
+            for e in engagement.enemies:
+                engaged_pairs[e.track_id] = (env_id, engagement.region)
+
+        rows = []
+        for tid, t in self.friendly_tracks.items():
+            env_ref = engaged_pairs.get(tid)
+            rows.append({
+                "track_id": tid,
+                "team": "ally",
+                "group_id": self._group_id_from_track(tid),
+                "lon": float(t.lon_lat[0]),
+                "lat": float(t.lon_lat[1]),
+                "status": "ENGAGED" if env_ref else "TRANSIT",
+                "env_id": env_ref[0] if env_ref else "",
+                "region": env_ref[1] if env_ref else "",
+            })
+        for tid, t in self.enemy_tracks.items():
+            env_ref = engaged_pairs.get(tid)
+            rows.append({
+                "track_id": tid,
+                "team": "enemy",
+                "group_id": tid,
+                "lon": float(t.lon_lat[0]),
+                "lat": float(t.lon_lat[1]),
+                "status": "ENGAGED" if env_ref else "TRANSIT",
+                "env_id": env_ref[0] if env_ref else "",
+                "region": env_ref[1] if env_ref else "",
+            })
+
+        self.db.log_tracks(self.run_id, self.global_step, rows)
 
     def _handle_events_with_llm(self, env_id: str, region: str, snapshot: Dict):
         for ally in snapshot.get("allies", []):
@@ -239,24 +283,40 @@ class KoreaAirCommanderSystem:
                 event_payload={"ally": ally.get("uid"), "decision": decision},
             )
 
-    def _nearest_available_base(self, enemy_pos: np.ndarray) -> Optional[BaseState]:
+    def _nearest_available_base(self, enemy_lon_lat: np.ndarray) -> Optional[BaseState]:
         candidates = [b for b in self.bases.values() if b.ready_fighters > 0]
         if not candidates:
             return None
-        return min(candidates, key=lambda b: np.linalg.norm(enemy_pos - np.array(b.position_km, dtype=np.float64)))
+        return min(
+            candidates,
+            key=lambda b: self._haversine_km(tuple(enemy_lon_lat), b.lon_lat),
+        )
 
     def _has_assigned_friendly(self, enemy_track_id: str) -> bool:
         return any(tid.endswith(f"_{enemy_track_id}") for tid in self.friendly_tracks.keys())
 
     def _paired_enemy(self, friendly_id: str) -> Optional[AirTrack]:
-        enemy_id = friendly_id.split("_")[-1]
+        enemy_id = self._group_id_from_track(friendly_id)
         return self.enemy_tracks.get(enemy_id)
 
     @staticmethod
-    def _region_name(midpoint_km: np.ndarray) -> str:
-        x, y = float(midpoint_km[0]), float(midpoint_km[1])
-        if y >= 37.5:
+    def _group_id_from_track(friendly_track_id: str) -> str:
+        return friendly_track_id.split("_")[-1]
+
+    @staticmethod
+    def _haversine_km(a_lon_lat: Tuple[float, float], b_lon_lat: Tuple[float, float]) -> float:
+        lon1, lat1 = map(math.radians, a_lon_lat)
+        lon2, lat2 = map(math.radians, b_lon_lat)
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+        h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        return 6371.0 * 2 * math.asin(math.sqrt(h))
+
+    @staticmethod
+    def _region_name(midpoint_lon_lat: np.ndarray) -> str:
+        lat = float(midpoint_lon_lat[1])
+        if lat >= 37.5:
             return "중부권"
-        if y <= 35.8:
+        if lat <= 35.8:
             return "남부권"
         return "수도권-중남부 경계"

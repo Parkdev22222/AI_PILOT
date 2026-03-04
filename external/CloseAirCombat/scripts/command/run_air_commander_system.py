@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 import argparse
+import os
+import sys
 import math
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 
 from command.air_commander_system import KoreaAirCommanderSystem
 
@@ -24,10 +28,11 @@ def main():
     )
 
     # Example: multiple enemy aircraft descending from different directions.
-    system.add_enemy_wave("BANDIT_NW_01", start_km=(124.0, 39.5), heading_rad=-math.pi / 4)
-    system.add_enemy_wave("BANDIT_NE_02", start_km=(130.5, 39.4), heading_rad=-3 * math.pi / 4)
-    system.add_enemy_wave("BANDIT_N_03", start_km=(127.5, 39.7), heading_rad=-math.pi / 2)
+    system.add_enemy_wave("BANDIT_NW_01", start_lon_lat=(124.0, 39.5), heading_rad=-math.pi / 4)
+    system.add_enemy_wave("BANDIT_NE_02", start_lon_lat=(130.5, 39.4), heading_rad=-3 * math.pi / 4)
+    system.add_enemy_wave("BANDIT_N_03", start_lon_lat=(127.5, 39.7), heading_rad=-math.pi / 2)
 
+    print(f"run_id={system.run_id}")
     for _ in range(args.steps):
         system.step(dt_seconds=args.dt_seconds)
 

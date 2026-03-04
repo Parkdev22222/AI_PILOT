@@ -105,6 +105,8 @@ If you find this repo useful, pleased use the following citation:
 - `command/commander_db.py`: 실시간 교전 DB 저장 모듈 (환경 ID, 교전 지역, 아군/적군 위치, 격추 여부, 잔여 무장량)
 - `scripts/command/run_air_commander_system.py`: 다방향 적기 남하 시나리오를 실행하고 거리 40km 이내 시 `MultipleCombatEnv`를 생성
 - `scripts/command/query_commander_rag.py`: EXAONE4 에이전트가 DB 조회 TOOL(RAG)로 상황 질의
+- `scripts/command/run_commander_web.py`: DB 실시간 상태 API(`/api/live_state`)와 한반도 지도 웹 대시보드를 제공하는 서버 스크립트
+- `web/command_dashboard/index.html`: 교전 지역(투명 빨강) + 이동중 편대(아군/적군 원형) 실시간 시각화 페이지
 
 시스템 개요:
 1) LLM이 한반도 전역 적기 남하 경로를 보고 출격 기지를 결정
@@ -112,4 +114,5 @@ If you find this repo useful, pleased use the following citation:
 3) 거리 40km 이내에서 지역별 `MultipleCombatEnv`가 동시 생성
 4) 교전 중 이벤트(아군 격추/무장 고갈) 발생 시 LLM이 RTB 여부를 판단
 5) 각 교전 환경 ID/지역/상태를 DB에 실시간 누적하고 LLM이 TOOL로 조회
+6) 웹 대시보드에서 교전중 지역은 투명 빨강으로, 이동중 편대는 아군/적군 원형으로 실시간 표시
 

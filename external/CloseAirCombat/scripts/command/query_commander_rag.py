@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 import argparse
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 
 from command.air_commander_system import Exaone4CommanderAgent
 from command.commander_db import CommanderCombatDB

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Air Commander Live Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .panel { position: absolute; top: 10px; left: 10px; z-index: 1000; background: rgba(0,0,0,.7); color: #fff; padding: 10px; border-radius: 8px; font-family: sans-serif; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel" id="panel">Loading...</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([36.2, 127.8], 7);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 12 }).addTo(map);
+
+const panel = document.getElementById('panel');
+const engagementLayer = L.layerGroup().addTo(map);
+const transitLayer = L.layerGroup().addTo(map);
+
+function groupBy(arr, key) {
+  return arr.reduce((acc, x) => {
+    const k = x[key] || '';
+    if (!acc[k]) acc[k] = [];
+    acc[k].push(x);
+    return acc;
+  }, {});
+}
+
+function center(tracks) {
+  if (!tracks.length) return null;
+  const lon = tracks.reduce((s, t) => s + t.lon, 0) / tracks.length;
+  const lat = tracks.reduce((s, t) => s + t.lat, 0) / tracks.length;
+  return { lon, lat };
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/live_state');
+    const data = await res.json();
+
+    engagementLayer.clearLayers();
+    transitLayer.clearLayers();
+
+    // 교전 중: 투명 빨간 원
+    for (const e of data.engagements || []) {
+      L.circle([e.center_lat, e.center_lon], {
+        radius: 20000,
+        color: '#ff0000',
+        fillColor: '#ff0000',
+        fillOpacity: 0.25,
+        weight: 1,
+      }).bindTooltip(`교전중 ${e.region} (${e.env_id})`).addTo(engagementLayer);
+    }
+
+    // 비교전 이동중: 2대 아군/2대 적군을 각각 하나의 원으로 표시
+    const transit = (data.tracks || []).filter(t => t.status === 'TRANSIT');
+    const grouped = groupBy(transit, 'group_id');
+    for (const [gid, tracks] of Object.entries(grouped)) {
+      const allies = tracks.filter(t => t.team === 'ally');
+      const enemies = tracks.filter(t => t.team === 'enemy');
+      const ac = center(allies);
+      const ec = center(enemies);
+
+      if (ac) {
+        L.circleMarker([ac.lat, ac.lon], {
+          radius: 12,
+          color: '#1f77ff',
+          fillColor: '#1f77ff',
+          fillOpacity: 0.35,
+          weight: 2,
+        }).bindTooltip(`아군 편대(${gid})`).addTo(transitLayer);
+      }
+      if (ec) {
+        L.circleMarker([ec.lat, ec.lon], {
+          radius: 12,
+          color: '#111111',
+          fillColor: '#111111',
+          fillOpacity: 0.35,
+          weight: 2,
+        }).bindTooltip(`적군 편대(${gid})`).addTo(transitLayer);
+      }
+    }
+
+    panel.textContent = `run=${data.run_id || '-'} step=${data.global_step || 0} transit_tracks=${transit.length} engagements=${(data.engagements || []).length}`;
+  } catch (e) {
+    panel.textContent = `error: ${e}`;
+  }
+}
+
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>
