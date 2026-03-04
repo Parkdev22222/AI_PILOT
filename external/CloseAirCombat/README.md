@@ -130,10 +130,13 @@ python scripts/command/run_air_commander_system.py \
   --enm-policy-dir /path/to/enm_policy_dir \
   --ego-policy-index latest \
   --enm-policy-index latest \
-  --policy-device cpu
+  --policy-device cpu \
+  --local-exaone-path /path/to/local/exaone4 \
+  --local-exaone-device cpu
 ```
 - 정책 경로를 주지 않으면 교전 단계는 기본 fallback action으로 동작합니다.
 - 실행 로그에서 `run_id=...` 값을 확인합니다.
+- 로컬 EXAONE4를 사용하려면 `transformers` 설치 후 `--local-exaone-path`에 로컬 모델 경로를 지정합니다.
 
 2. 실시간 지도 웹 대시보드 실행
 ```bash
@@ -154,6 +157,8 @@ cd external/CloseAirCombat
 python scripts/command/query_commander_rag.py \
   --db-path /tmp/commander_live.db \
   --model-id exaone4 \
+  --local-exaone-path /path/to/local/exaone4 \
+  --local-exaone-device cpu \
   --prompt "현재 교전 중인 지역과 아군 손실 현황을 요약해줘"
 ```
 

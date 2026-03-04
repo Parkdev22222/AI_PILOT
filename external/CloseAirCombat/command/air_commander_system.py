@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -71,14 +72,61 @@ class Engagement:
 
 
 class Exaone4CommanderAgent:
-    """smolagents-based commander wrapper. Falls back to heuristic if unavailable."""
+    """Local EXAONE4-first commander wrapper with heuristic fallback.
 
-    def __init__(self, db: CommanderCombatDB, model_id: str = "exaone4"):
+    Priority:
+    1) Local EXAONE4 (transformers) if local path is provided.
+    2) smolagents tool agent if available.
+    3) deterministic heuristic strings.
+    """
+
+    def __init__(
+        self,
+        db: CommanderCombatDB,
+        model_id: str = "exaone4",
+        local_model_path: str = "",
+        device: str = "cpu",
+        max_new_tokens: int = 96,
+    ):
         self.db = db
         self.model_id = model_id
-        self.agent = self._build_agent()
+        self.local_model_path = local_model_path or os.getenv("EXAONE4_LOCAL_MODEL_PATH", "")
+        self.device = device
+        self.max_new_tokens = max_new_tokens
 
-    def _build_agent(self):
+        self._local_tokenizer = None
+        self._local_model = None
+        self._smol_agent = None
+
+        self._build_local_exaone()
+        if self._local_model is None:
+            self._smol_agent = self._build_smol_agent()
+
+    def _build_local_exaone(self):
+        if not self.local_model_path:
+            return
+        if not os.path.exists(self.local_model_path):
+            return
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except Exception:
+            return
+
+        try:
+            self._local_tokenizer = AutoTokenizer.from_pretrained(self.local_model_path, trust_remote_code=True)
+            torch_dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+            self._local_model = AutoModelForCausalLM.from_pretrained(
+                self.local_model_path,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+            )
+            self._local_model.to(self.device)
+            self._local_model.eval()
+        except Exception:
+            self._local_tokenizer = None
+            self._local_model = None
+
+    def _build_smol_agent(self):
         try:
             from smolagents import CodeAgent, LiteLLMModel, tool
         except Exception:
@@ -89,24 +137,64 @@ class Exaone4CommanderAgent:
             """Run SELECT query for current Korea air battle DB."""
             return self.db.query(sql_query)
 
-        model = LiteLLMModel(model_id=self.model_id)
-        return CodeAgent(tools=[query_battle_db], model=model)
+        try:
+            model = LiteLLMModel(model_id=self.model_id)
+            return CodeAgent(tools=[query_battle_db], model=model)
+        except Exception:
+            return None
+
+    def _local_generate(self, system_instruction: str, user_prompt: str) -> Optional[str]:
+        if self._local_model is None or self._local_tokenizer is None:
+            return None
+        prompt = (
+            "[SYSTEM]\n"
+            + system_instruction
+            + "\n\n[CONTEXT]\n"
+            + user_prompt
+            + "\n\n[OUTPUT]\n"
+        )
+        try:
+            inputs = self._local_tokenizer(prompt, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                out = self._local_model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    eos_token_id=self._local_tokenizer.eos_token_id,
+                )
+            text = self._local_tokenizer.decode(out[0], skip_special_tokens=True)
+            return text[len(prompt):].strip() if text.startswith(prompt) else text.strip()
+        except Exception:
+            return None
+
+    def _smol_generate(self, prompt: str) -> Optional[str]:
+        if self._smol_agent is None:
+            return None
+        try:
+            return str(self._smol_agent.run(prompt))
+        except Exception:
+            return None
 
     def decide_scramble(self, prompt: str) -> str:
-        if self.agent is None:
-            return "HEURISTIC: scramble nearest base with available fighters"
-        try:
-            return str(self.agent.run(prompt))
-        except Exception:
-            return "HEURISTIC: scramble nearest base with available fighters"
+        sys_inst = (
+            "당신은 공군 작전 지휘관이다. 반드시 'BASE=<Seosan|Daegu|Gangneung>' 형식으로 시작해 답하라. "
+            "뒤에 짧은 이유를 붙여도 된다."
+        )
+        text = self._local_generate(sys_inst, prompt) or self._smol_generate(prompt)
+        if text:
+            return text
+        return "BASE=Seosan HEURISTIC: scramble nearest base with available fighters"
 
     def decide_rtb(self, prompt: str) -> str:
-        if self.agent is None:
-            return "RTB_IF_SHOTDOWN_OR_EMPTY"
-        try:
-            return str(self.agent.run(prompt))
-        except Exception:
-            return "RTB_IF_SHOTDOWN_OR_EMPTY"
+        sys_inst = (
+            "당신은 공군 작전 지휘관이다. 반드시 'RTB=YES' 또는 'RTB=NO'로 시작해 답하라. "
+            "격추 또는 무장고갈이면 일반적으로 YES를 권고한다."
+        )
+        text = self._local_generate(sys_inst, prompt) or self._smol_generate(prompt)
+        if text:
+            return text
+        return "RTB=YES HEURISTIC: RTB_IF_SHOTDOWN_OR_EMPTY"
 
 
 class KoreaAirCommanderSystem:
@@ -117,6 +205,8 @@ class KoreaAirCommanderSystem:
         db_path: str,
         scenario_name: str = "2v2/NoWeapon/HierarchySelfplay",
         model_id: str = "exaone4",
+        local_exaone_path: str = "",
+        local_exaone_device: str = "cpu",
         ego_policy_dir: str = "",
         enm_policy_dir: str = "",
         ego_policy_index: str = "latest",
@@ -126,7 +216,12 @@ class KoreaAirCommanderSystem:
         self.db = CommanderCombatDB(db_path)
         self.run_id = f"korea_commander_{int(time.time())}"
         self.scenario_name = scenario_name
-        self.commander = Exaone4CommanderAgent(self.db, model_id=model_id)
+        self.commander = Exaone4CommanderAgent(
+            self.db,
+            model_id=model_id,
+            local_model_path=local_exaone_path,
+            device=local_exaone_device,
+        )
 
         self.ego_policy_dir = ego_policy_dir
         self.enm_policy_dir = enm_policy_dir
@@ -186,6 +281,17 @@ class KoreaAirCommanderSystem:
         self._ego_policy.load_state_dict(torch.load(ego_path, map_location=self.policy_device))
         self._enm_policy.load_state_dict(torch.load(enm_path, map_location=self.policy_device))
 
+    def _select_base_from_decision(self, decision_text: str, nearest_base: BaseState) -> BaseState:
+        upper_text = decision_text.upper()
+        base_match = re.search(r"BASE\s*=\s*(SEOSAN|DAEGU|GANGNEUNG)", upper_text)
+        if not base_match:
+            return nearest_base
+        target = base_match.group(1).capitalize()
+        chosen = self.bases.get(target, nearest_base)
+        if chosen.ready_fighters <= 0:
+            return nearest_base
+        return chosen
+
     def _launch_interceptors(self):
         for enemy in self.enemy_tracks.values():
             if enemy.is_shotdown:
@@ -208,7 +314,7 @@ class KoreaAirCommanderSystem:
                 event_payload={"enemy_id": enemy.track_id, "decision": commander_answer},
             )
 
-            base = nearest_base
+            base = self._select_base_from_decision(commander_answer, nearest_base)
             base.ready_fighters -= 1
             vec = enemy.lon_lat - np.array(base.lon_lat, dtype=np.float64)
             heading = math.atan2(vec[1], vec[0])

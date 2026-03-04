@@ -14,6 +14,8 @@ def parse_args():
     parser.add_argument("--db-path", type=str, required=True)
     parser.add_argument("--scenario-name", type=str, default="2v2/NoWeapon/HierarchySelfplay")
     parser.add_argument("--model-id", type=str, default="exaone4")
+    parser.add_argument("--local-exaone-path", type=str, default="")
+    parser.add_argument("--local-exaone-device", type=str, default="cpu")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--dt-seconds", type=float, default=10.0)
     parser.add_argument("--ego-policy-dir", type=str, default="")
@@ -30,6 +32,8 @@ def main():
         db_path=args.db_path,
         scenario_name=args.scenario_name,
         model_id=args.model_id,
+        local_exaone_path=args.local_exaone_path,
+        local_exaone_device=args.local_exaone_device,
         ego_policy_dir=args.ego_policy_dir,
         enm_policy_dir=args.enm_policy_dir,
         ego_policy_index=args.ego_policy_index,
