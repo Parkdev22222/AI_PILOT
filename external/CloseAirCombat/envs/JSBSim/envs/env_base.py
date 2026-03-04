@@ -129,6 +129,7 @@ class BaseEnv(gymnasium.Env):
         """
         self.current_step += 1
         info = {"current_step": self.current_step, "temp_sim_events": []}
+        info["battle_snapshot"] = self._build_battle_snapshot()
         # apply actions
         action = self._unpack(action)
         for agent_id in self.agents.keys():
@@ -163,6 +164,22 @@ class BaseEnv(gymnasium.Env):
             rewards[agent_id] = [reward]
 
         return self._pack(obs), self._pack(rewards), self._pack(dones), info
+
+
+    def _build_battle_snapshot(self):
+        snapshot = {"allies": [], "enemies": []}
+        for uid, sim in self._jsbsims.items():
+            unit = {
+                "uid": uid,
+                "position": np.array(sim.get_position(), dtype=np.float64).tolist(),
+                "is_shotdown": bool(sim.is_shotdown),
+                "missiles_remaining": int(getattr(sim, "num_left_missiles", 0)),
+            }
+            if uid in self.ego_ids:
+                snapshot["allies"].append(unit)
+            else:
+                snapshot["enemies"].append(unit)
+        return snapshot
 
     def get_obs(self):
         """Returns all agent observations in a list.

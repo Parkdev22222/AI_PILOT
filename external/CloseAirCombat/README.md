@@ -98,3 +98,18 @@ If you find this repo useful, pleased use the following citation:
   journal = {GitHub repository},
   howpublished = {\url{https://github.com/liuqh16/CloseAirCombat}},
 }
+
+
+## Air Commander LLM System (New)
+- `command/air_commander_system.py`: 엑사원4 기반 공군 지휘관 에이전트 + 다중 기지 출격/다중 지역 교전 생성 오케스트레이터
+- `command/commander_db.py`: 실시간 교전 DB 저장 모듈 (환경 ID, 교전 지역, 아군/적군 위치, 격추 여부, 잔여 무장량)
+- `scripts/command/run_air_commander_system.py`: 다방향 적기 남하 시나리오를 실행하고 거리 40km 이내 시 `MultipleCombatEnv`를 생성
+- `scripts/command/query_commander_rag.py`: EXAONE4 에이전트가 DB 조회 TOOL(RAG)로 상황 질의
+
+시스템 개요:
+1) LLM이 한반도 전역 적기 남하 경로를 보고 출격 기지를 결정
+2) 아군/적군이 시속 2000km로 접근
+3) 거리 40km 이내에서 지역별 `MultipleCombatEnv`가 동시 생성
+4) 교전 중 이벤트(아군 격추/무장 고갈) 발생 시 LLM이 RTB 여부를 판단
+5) 각 교전 환경 ID/지역/상태를 DB에 실시간 누적하고 LLM이 TOOL로 조회
+

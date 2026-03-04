@@ -67,6 +67,7 @@ class MultipleCombatEnv(BaseEnv):
         """
         self.current_step += 1
         info = {"current_step": self.current_step, "temp_sim_events": []}
+        info["battle_snapshot"] = self._build_battle_snapshot()
 
         # apply actions
         action = self._unpack(action)
