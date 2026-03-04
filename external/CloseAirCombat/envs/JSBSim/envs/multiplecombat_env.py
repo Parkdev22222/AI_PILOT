@@ -66,19 +66,26 @@ class MultipleCombatEnv(BaseEnv):
                 info: auxiliary information
         """
         self.current_step += 1
-        info = {"current_step": self.current_step}
+        info = {"current_step": self.current_step, "temp_sim_events": []}
 
         # apply actions
         action = self._unpack(action)
         for agent_id in self.agents.keys():
-            a_action = self.task.normalize_action(self, agent_id, action[agent_id])
+            agent_action = action[agent_id]
+            if hasattr(self.task, "mask_action"):
+                agent_action = self.task.mask_action(self, agent_id, agent_action)
+            a_action = self.task.normalize_action(self, agent_id, agent_action)
             self.agents[agent_id].set_property_values(self.task.action_var, a_action)
         # run simulation
         for _ in range(self.agent_interaction_steps):
             for sim in self._jsbsims.values():
-                sim.run()
+                sim_event = sim.run()
+                if sim_event is not None:
+                    info["temp_sim_events"].append(sim_event)
             for sim in self._tempsims.values():
-                sim.run()
+                sim_event = sim.run()
+                if sim_event is not None:
+                    info["temp_sim_events"].append(sim_event)
         self.task.step(self)
         obs = self.get_obs()
         share_obs = self.get_state()
