@@ -20,8 +20,8 @@ def parse_args():
 
 
 def _build_map_html(state):
-    tracks = state.get("tracks", [])
-    engagements = state.get("engagements", [])
+    tracks = state.get("tracks") or []
+    engagements = state.get("engagements") or []
     payload = json.dumps({"tracks": tracks, "engagements": engagements}, ensure_ascii=False)
 
     return f"""
@@ -29,12 +29,14 @@ def _build_map_html(state):
 <script>
 (function() {{
   const data = {payload};
+  const tracks = Array.isArray(data.tracks) ? data.tracks : [];
+  const engagements = Array.isArray(data.engagements) ? data.engagements : [];
   const mapEl = document.getElementById('map');
   mapEl.innerHTML = '';
 
   const canvas = document.createElement('canvas');
-  canvas.width = mapEl.clientWidth || 900;
-  canvas.height = mapEl.clientHeight || 600;
+  canvas.width = Math.max(mapEl.clientWidth || 0, 900);
+  canvas.height = Math.max(mapEl.clientHeight || 0, 600);
   canvas.style.width = '100%';
   canvas.style.height = '100%';
   mapEl.appendChild(canvas);
@@ -105,66 +107,91 @@ def _build_map_html(state):
     ctx.fillText(text, x + 6 + pad, y + 4);
   }}
 
-  drawBaseMap();
+  function drawScene() {{
+    drawBaseMap();
 
-  for (const e of (data.engagements || [])) {{
-    const [x, y] = project(e.center_lon, e.center_lat);
-    const r = kmToPixels(20);
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,0,0,0.25)';
-    ctx.strokeStyle = 'rgba(200,0,0,0.8)';
-    ctx.lineWidth = 1.5;
-    ctx.fill();
-    ctx.stroke();
-    drawLabel(`교전중 ${{e.region}} (${{e.env_id}})`, x, y);
-  }}
-
-  function groupBy(arr, key) {{
-    return arr.reduce((acc, x) => {{
-      const k = x[key] || '';
-      if (!acc[k]) acc[k] = [];
-      acc[k].push(x);
-      return acc;
-    }}, {{}});
-  }}
-  function center(tracks) {{
-    if (!tracks.length) return null;
-    const lon = tracks.reduce((s, t) => s + t.lon, 0) / tracks.length;
-    const lat = tracks.reduce((s, t) => s + t.lat, 0) / tracks.length;
-    return {{ lon, lat }};
-  }}
-
-  const transit = (data.tracks || []).filter(t => t.status === 'TRANSIT');
-  const grouped = groupBy(transit, 'group_id');
-  for (const [gid, tracks] of Object.entries(grouped)) {{
-    const allies = tracks.filter(t => t.team === 'ally');
-    const enemies = tracks.filter(t => t.team === 'enemy');
-    const ac = center(allies);
-    const ec = center(enemies);
-
-    if (ac) {{
-      const [x, y] = project(ac.lon, ac.lat);
+    for (const e of engagements) {{
+      if (typeof e.center_lon !== 'number' || typeof e.center_lat !== 'number') continue;
+      const [x, y] = project(e.center_lon, e.center_lat);
+      const r = kmToPixels(20);
       ctx.beginPath();
-      ctx.arc(x, y, 12, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(31,119,255,0.35)';
-      ctx.strokeStyle = '#1f77ff';
-      ctx.lineWidth = 2;
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,0,0,0.25)';
+      ctx.strokeStyle = 'rgba(200,0,0,0.8)';
+      ctx.lineWidth = 1.5;
       ctx.fill();
       ctx.stroke();
-      drawLabel(`아군 편대(${{gid}})`, x, y);
+      drawLabel(`교전중 ${{e.region || '-'}} (${{e.env_id || '-'}})`, x, y);
     }}
-    if (ec) {{
-      const [x, y] = project(ec.lon, ec.lat);
-      ctx.beginPath();
-      ctx.arc(x, y, 12, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(17,17,17,0.35)';
-      ctx.strokeStyle = '#111111';
-      ctx.lineWidth = 2;
-      ctx.fill();
-      ctx.stroke();
-      drawLabel(`적군 편대(${{gid}})`, x, y);
+
+    function groupBy(arr, key) {{
+      return arr.reduce((acc, x) => {{
+        const k = x[key] || '';
+        if (!acc[k]) acc[k] = [];
+        acc[k].push(x);
+        return acc;
+      }}, {{}});
     }}
+    function center(groupTracks) {{
+      if (!groupTracks.length) return null;
+      const lon = groupTracks.reduce((s, t) => s + t.lon, 0) / groupTracks.length;
+      const lat = groupTracks.reduce((s, t) => s + t.lat, 0) / groupTracks.length;
+      return {{ lon, lat }};
+    }}
+
+    const transit = tracks.filter(t => t && t.status === 'TRANSIT' && typeof t.lon === 'number' && typeof t.lat === 'number');
+    const grouped = groupBy(transit, 'group_id');
+    for (const [gid, groupTracks] of Object.entries(grouped)) {{
+      const allies = groupTracks.filter(t => t.team === 'ally');
+      const enemies = groupTracks.filter(t => t.team === 'enemy');
+      const ac = center(allies);
+      const ec = center(enemies);
+
+      if (ac) {{
+        const [x, y] = project(ac.lon, ac.lat);
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(31,119,255,0.35)';
+        ctx.strokeStyle = '#1f77ff';
+        ctx.lineWidth = 2;
+        ctx.fill();
+        ctx.stroke();
+        drawLabel(`아군 편대(${{gid}})`, x, y);
+      }}
+      if (ec) {{
+        const [x, y] = project(ec.lon, ec.lat);
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(17,17,17,0.35)';
+        ctx.strokeStyle = '#111111';
+        ctx.lineWidth = 2;
+        ctx.fill();
+        ctx.stroke();
+        drawLabel(`적군 편대(${{gid}})`, x, y);
+      }}
+    }}
+
+    if (!tracks.length && !engagements.length) {{
+      drawLabel('현재 트랙/교전 데이터 없음 (지도 베이스만 표시)', 12, 24);
+    }}
+  }}
+
+  function redrawWithCurrentSize() {{
+    const w = Math.max(mapEl.clientWidth || 0, 900);
+    const h = Math.max(mapEl.clientHeight || 0, 600);
+    if (canvas.width !== w || canvas.height !== h) {{
+      canvas.width = w;
+      canvas.height = h;
+    }}
+    drawScene();
+  }}
+
+  redrawWithCurrentSize();
+  requestAnimationFrame(redrawWithCurrentSize);
+  window.addEventListener('resize', redrawWithCurrentSize, {{ passive: true }});
+  if (window.ResizeObserver) {{
+    const ro = new ResizeObserver(redrawWithCurrentSize);
+    ro.observe(mapEl);
   }}
 }})();
 </script>
