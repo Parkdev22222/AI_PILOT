@@ -547,6 +547,7 @@ class MissileSimulator(BaseSimulator):
         if distance < self._Rc and self.target_aircraft.is_alive:
             self.__status = MissileSimulator.HIT
             self.target_aircraft.shotdown()
+            return self.uid, MissileSimulator.HIT
         elif (self._t > self._t_max) or (np.linalg.norm(self.get_velocity()) < self._v_min) \
                 or np.sum(self._distance_increment) >= self._distance_increment.maxlen or not self.target_aircraft.is_alive:
             self.__status = MissileSimulator.MISS
