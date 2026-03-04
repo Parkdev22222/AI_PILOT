@@ -5,7 +5,7 @@ from collections import deque
 from .singlecombat_task import SingleCombatTask, HierarchicalSingleCombatTask
 from ..reward_functions import AltitudeReward, PostureReward, MissilePostureReward, EventDrivenReward, ShootPenaltyReward
 from ..core.simulatior import MissileSimulator
-from ..utils.utils import LLA2NEU, get_AO_TA_R
+from ..utils.utils import LLA2NEU, get_AO_TA_R, in_range_rad
 
 
 class SingleCombatDodgeMissileTask(SingleCombatTask):
@@ -26,6 +26,16 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
 
     def load_observation_space(self):
         self.observation_space = spaces.Box(low=-10, high=10., shape=(21,))
+
+    def load_action_space(self):
+        # high-level control + shoot flag
+        self.action_space = spaces.MultiDiscrete([3, 5, 3, 2])
+
+    def normalize_action(self, env, agent_id, action):
+        action = np.asarray(action)
+        # [altitude, heading, velocity, shoot_flag] -> use first 3 for control
+        flight_action = action[:3].astype(np.int32)
+        return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, flight_action)
 
     def get_obs(self, env, agent_id):
         """
@@ -76,14 +86,17 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         norm_obs[6] = ego_obs_list[10] / 340
         norm_obs[7] = ego_obs_list[11] / 340
         norm_obs[8] = ego_obs_list[12] / 340
-        # (2) relative enm info
-        ego_AO, ego_TA, R, side_flag = get_AO_TA_R(ego_feature, enm_feature, return_side=True)
-        norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
-        norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
-        norm_obs[11] = ego_AO
-        norm_obs[12] = ego_TA
-        norm_obs[13] = R / 10000
-        norm_obs[14] = side_flag
+        # (2) relative enm info (radar-gated)
+        radar_hits = env.agents[agent_id].get_radar_detections()
+        enm_detected = any(hit['target_id'] == env.agents[agent_id].enemies[0].uid for hit in radar_hits)
+        if enm_detected:
+            ego_AO, ego_TA, R, side_flag = get_AO_TA_R(ego_feature, enm_feature, return_side=True)
+            norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
+            norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
+            norm_obs[11] = ego_AO
+            norm_obs[12] = ego_TA
+            norm_obs[13] = R / 10000
+            norm_obs[14] = side_flag
         # (3) relative missile info
         missile_sim = env.agents[agent_id].check_missile_warning()
         if missile_sim is not None:
@@ -104,6 +117,116 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         self.remaining_missiles = {agent_id: agent.num_missiles for agent_id, agent in env.agents.items()}
         self.lock_duration = {agent_id: deque(maxlen=int(1 / env.time_interval)) for agent_id in env.agents.keys()}
         return super().reset(env)
+
+    def mask_action(self, env, agent_id, action):
+        """Mask high-level action [altitude, heading, velocity, shoot_flag].
+
+        Action semantics (discrete):
+            - altitude: 0 (down), 1 (hold), 2 (up)
+            - heading: 0 (left) ... 4 (right)
+            - velocity: 0 (min) ... 2 (max)
+
+        Missile warning branch uses missile direction/speed to induce a
+        perpendicular break turn so missile turn-demand/energy loss increases.
+        """
+        action_arr = np.array(action, copy=True)
+        if action_arr.shape[-1] < 4:
+            return action_arr
+
+        flight_action = action_arr[:3].copy()
+        shoot_flag = action_arr[3:4].copy()
+
+        def _pack(masked_flight_action):
+            return np.concatenate([masked_flight_action, shoot_flag], axis=-1)
+
+        def _apply_max_speed(masked_flight_action):
+            # velocity index semantics: 2 == max speed
+            masked_flight_action[2] = 2
+            return masked_flight_action
+
+        missile_sim = env.agents[agent_id].check_missile_warning()
+        if missile_sim is None or not missile_sim.is_alive:
+            # No missile warning: steer toward the nearest alive enemy until 10 km.
+            enemies = [enemy for enemy in env.agents[agent_id].enemies if enemy.is_alive]
+            if not enemies:
+                return _pack(flight_action)
+
+            ego_pos = np.array(env.agents[agent_id].get_position(), dtype=np.float64)
+            closest_enemy = min(enemies, key=lambda enemy: np.linalg.norm(np.array(enemy.get_position(), dtype=np.float64) - ego_pos))
+            rel_vec = np.array(closest_enemy.get_position(), dtype=np.float64) - ego_pos
+            rel_distance = np.linalg.norm(rel_vec)
+
+            # Already close enough: keep policy action.
+            if rel_distance <= 10000.0:
+                return _pack(flight_action)
+
+            rel_xy = rel_vec[:2]
+            rel_xy_norm = np.linalg.norm(rel_xy)
+            if rel_xy_norm < 1e-6:
+                return _pack(flight_action)
+
+            ego_vel = np.array(env.agents[agent_id].get_velocity(), dtype=np.float64)
+            ego_xy = ego_vel[:2]
+            ego_heading = np.arctan2(ego_xy[1], ego_xy[0]) if np.linalg.norm(ego_xy) > 1e-6 else 0.0
+            enemy_heading = np.arctan2(rel_xy[1], rel_xy[0])
+            azimuth = in_range_rad(enemy_heading - ego_heading)
+            elevation = np.arctan2(rel_vec[2], rel_xy_norm)
+
+            masked = flight_action.copy()
+            # If enemy is behind (|azimuth| > 90 deg), force one-direction break turn
+            # so enemy can be brought to the front hemisphere.
+            if abs(azimuth) > np.pi / 2:
+                masked[1] = 4  # always turn right when enemy is behind
+            else:
+                # Enemy is in front hemisphere: turn toward enemy bearing.
+                masked[1] = 0 if azimuth > 0 else 4
+
+            # Climb/descend toward enemy altitude if vertical offset is meaningful.
+            if elevation > np.deg2rad(5.0):
+                masked[0] = 2
+            elif elevation < -np.deg2rad(5.0):
+                masked[0] = 0
+            # Keep current velocity command from policy.
+            return _pack(masked)
+
+        ego_velocity = np.array(env.agents[agent_id].get_velocity(), dtype=np.float64)
+        missile_velocity = np.array(missile_sim.get_velocity(), dtype=np.float64)
+
+        ego_xy = ego_velocity[:2]
+        missile_xy = missile_velocity[:2]
+        missile_speed = np.linalg.norm(missile_velocity)
+
+        masked = _apply_max_speed(flight_action.copy())
+
+        # Degenerate case: missile direction unavailable -> keep max speed only.
+        if np.linalg.norm(missile_xy) < 1e-6:
+            return _pack(masked)
+
+        # Choose a perpendicular heading (left/right) against missile approach direction.
+        ego_heading = np.arctan2(ego_xy[1], ego_xy[0]) if np.linalg.norm(ego_xy) > 1e-6 else 0.0
+        missile_heading = np.arctan2(missile_xy[1], missile_xy[0])
+        candidate_left = missile_heading + np.pi / 2
+        candidate_right = missile_heading - np.pi / 2
+
+        left_delta = abs(in_range_rad(candidate_left - ego_heading))
+        right_delta = abs(in_range_rad(candidate_right - ego_heading))
+        turn_left = left_delta <= right_delta
+        masked[1] = 0 if turn_left else 4
+
+        # Missile speed-aware vertical break: faster missile -> stronger vertical split.
+        if missile_speed >= 350.0:
+            # If missile is climbing toward us, break down; if diving, break up.
+            missile_vz = missile_velocity[2]
+            if missile_vz > 0:
+                masked[0] = 0
+            elif missile_vz < 0:
+                masked[0] = 2
+            else:
+                masked[0] = 0 if turn_left else 2
+        else:
+            masked[0] = 1
+
+        return _pack(masked)
 
     def step(self, env):
         SingleCombatTask.step(self, env)
@@ -142,13 +265,16 @@ class HierarchicalSingleCombatDodgeMissileTask(HierarchicalSingleCombatTask, Sin
         return SingleCombatDodgeMissileTask.load_observation_space(self)
 
     def load_action_space(self):
-        return HierarchicalSingleCombatTask.load_action_space(self)
+        # high-level control + shoot flag
+        self.action_space = spaces.MultiDiscrete([3, 5, 3, 2])
 
     def get_obs(self, env, agent_id):
         return SingleCombatDodgeMissileTask.get_obs(self, env, agent_id)
 
     def normalize_action(self, env, agent_id, action):
-        return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, action)
+        action = np.asarray(action)
+        flight_action = action[:3].astype(np.int32)
+        return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, flight_action)
 
     def reset(self, env):
         self._inner_rnn_states = {agent_id: np.zeros((1, 1, 128)) for agent_id in env.agents.keys()}
@@ -171,6 +297,16 @@ class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
 
     def load_observation_space(self):
         self.observation_space = spaces.Box(low=-10, high=10., shape=(21,))
+
+    def load_action_space(self):
+        # high-level control + shoot flag
+        self.action_space = spaces.MultiDiscrete([3, 5, 3, 2])
+
+    def normalize_action(self, env, agent_id, action):
+        action = np.asarray(action)
+        # [altitude, heading, velocity, shoot_flag] -> use first 3 for control
+        flight_action = action[:3].astype(np.int32)
+        return HierarchicalSingleCombatTask.normalize_action(self, env, agent_id, flight_action)
 
     def load_action_space(self):
         # aileron, elevator, rudder, throttle, shoot control
