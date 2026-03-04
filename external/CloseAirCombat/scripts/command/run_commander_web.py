@@ -25,28 +25,99 @@ def _build_map_html(state):
     payload = json.dumps({"tracks": tracks, "engagements": engagements}, ensure_ascii=False)
 
     return f"""
-<div id="map" style="height:78vh;border:1px solid #ddd;border-radius:8px;"></div>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<div id="map" style="height:78vh;border:1px solid #ddd;border-radius:8px;position:relative;background:#f6f8fb;"></div>
 <script>
 (function() {{
   const data = {payload};
   const mapEl = document.getElementById('map');
   mapEl.innerHTML = '';
-  const map = L.map('map').setView([36.2, 127.8], 7);
-  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 12 }}).addTo(map);
 
-  const engagementLayer = L.layerGroup().addTo(map);
-  const transitLayer = L.layerGroup().addTo(map);
+  const canvas = document.createElement('canvas');
+  canvas.width = mapEl.clientWidth || 900;
+  canvas.height = mapEl.clientHeight || 600;
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  mapEl.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+
+  // Offline-friendly Korea bounding box projection (no external map/tile dependency).
+  const BOUNDS = {{ minLon: 124.5, maxLon: 132.5, minLat: 33.0, maxLat: 39.8 }};
+  function project(lon, lat) {{
+    const x = ((lon - BOUNDS.minLon) / (BOUNDS.maxLon - BOUNDS.minLon)) * canvas.width;
+    const y = canvas.height - ((lat - BOUNDS.minLat) / (BOUNDS.maxLat - BOUNDS.minLat)) * canvas.height;
+    return [x, y];
+  }}
+  function kmToPixels(km) {{
+    const lonSpanKm = (BOUNDS.maxLon - BOUNDS.minLon) * 88.0; // rough conversion near Korea latitude.
+    return (km / lonSpanKm) * canvas.width;
+  }}
+
+  function drawBaseMap() {{
+    ctx.fillStyle = '#eef3f9';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // grid
+    ctx.strokeStyle = '#d6deea';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 8; i++) {{
+      const x = (i / 8) * canvas.width;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
+      ctx.stroke();
+    }}
+    for (let i = 0; i <= 6; i++) {{
+      const y = (i / 6) * canvas.height;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+      ctx.stroke();
+    }}
+
+    // Simplified peninsula polyline for operator orientation.
+    const koreaOutline = [
+      [126.0, 34.2], [126.8, 35.1], [127.7, 36.0], [128.8, 37.0],
+      [129.8, 38.2], [128.9, 39.0], [127.0, 38.6], [126.0, 37.7],
+      [125.4, 36.3], [125.6, 35.0], [126.0, 34.2],
+    ];
+    ctx.beginPath();
+    koreaOutline.forEach((p, idx) => {{
+      const [x, y] = project(p[0], p[1]);
+      if (idx === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }});
+    ctx.closePath();
+    ctx.fillStyle = '#dfe8d8';
+    ctx.strokeStyle = '#9fb090';
+    ctx.lineWidth = 2;
+    ctx.fill();
+    ctx.stroke();
+  }}
+
+  function drawLabel(text, x, y) {{
+    ctx.font = '12px sans-serif';
+    const pad = 3;
+    const w = ctx.measureText(text).width + 2 * pad;
+    const h = 16;
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.fillRect(x + 6, y - h / 2, w, h);
+    ctx.fillStyle = '#222';
+    ctx.fillText(text, x + 6 + pad, y + 4);
+  }}
+
+  drawBaseMap();
 
   for (const e of (data.engagements || [])) {{
-    L.circle([e.center_lat, e.center_lon], {{
-      radius: 20000,
-      color: '#ff0000',
-      fillColor: '#ff0000',
-      fillOpacity: 0.25,
-      weight: 1,
-    }}).bindTooltip(`교전중 ${{e.region}} (${{e.env_id}})`).addTo(engagementLayer);
+    const [x, y] = project(e.center_lon, e.center_lat);
+    const r = kmToPixels(20);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,0,0,0.25)';
+    ctx.strokeStyle = 'rgba(200,0,0,0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.fill();
+    ctx.stroke();
+    drawLabel(`교전중 ${{e.region}} (${{e.env_id}})`, x, y);
   }}
 
   function groupBy(arr, key) {{
@@ -73,14 +144,26 @@ def _build_map_html(state):
     const ec = center(enemies);
 
     if (ac) {{
-      L.circleMarker([ac.lat, ac.lon], {{
-        radius: 12, color: '#1f77ff', fillColor: '#1f77ff', fillOpacity: 0.35, weight: 2,
-      }}).bindTooltip(`아군 편대(${{gid}})`).addTo(transitLayer);
+      const [x, y] = project(ac.lon, ac.lat);
+      ctx.beginPath();
+      ctx.arc(x, y, 12, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(31,119,255,0.35)';
+      ctx.strokeStyle = '#1f77ff';
+      ctx.lineWidth = 2;
+      ctx.fill();
+      ctx.stroke();
+      drawLabel(`아군 편대(${{gid}})`, x, y);
     }}
     if (ec) {{
-      L.circleMarker([ec.lat, ec.lon], {{
-        radius: 12, color: '#111111', fillColor: '#111111', fillOpacity: 0.35, weight: 2,
-      }}).bindTooltip(`적군 편대(${{gid}})`).addTo(transitLayer);
+      const [x, y] = project(ec.lon, ec.lat);
+      ctx.beginPath();
+      ctx.arc(x, y, 12, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(17,17,17,0.35)';
+      ctx.strokeStyle = '#111111';
+      ctx.lineWidth = 2;
+      ctx.fill();
+      ctx.stroke();
+      drawLabel(`적군 편대(${{gid}})`, x, y);
     }}
   }}
 }})();
