@@ -15,6 +15,45 @@ def _t2n(x):
 
 class ShareJSBSimRunner(Runner):
 
+    def _action_masking(self, obs, actions):
+        """Missile-turn-maximizing masking for [altitude, heading, velocity, missile_launch].
+
+        Discrete action semantics:
+            altitude: 0(down), 1(hold), 2(up)
+            heading:  0(left) ... 4(right)
+            velocity: 0(low), 1(mid), 2(max)
+        We use incoming-missile direction/speed cues from the missile block in obs
+        to force perpendicular evasive turns and high speed so the missile expends
+        more turn energy.
+        """
+        masked_actions = actions.copy()
+        for env_idx in range(masked_actions.shape[0]):
+            for agent_idx in range(masked_actions.shape[1]):
+                agent_obs = obs[env_idx, agent_idx]
+                missile_feat = agent_obs[-6:]
+                missile_rel_speed = float(missile_feat[0])
+                missile_distance_norm = float(missile_feat[4])
+                missile_side_flag = float(missile_feat[5])
+
+                # No missile warning in this obs block.
+                if abs(missile_rel_speed) < 1e-6 and abs(missile_distance_norm) < 1e-6 and abs(missile_side_flag) < 1e-6:
+                    continue
+
+                # Force maximum ownship speed: velocity index 2.
+                masked_actions[env_idx, agent_idx, 2] = 2
+
+                # Make missile turn harder: break opposite to missile side.
+                turn_left = missile_side_flag >= 0.0
+                masked_actions[env_idx, agent_idx, 1] = 0 if turn_left else 4
+
+                # If missile is relatively fast/close, add vertical split-S/barrel tendency.
+                if missile_distance_norm <= 0.25 or missile_rel_speed >= 0.3:
+                    masked_actions[env_idx, agent_idx, 0] = 0 if turn_left else 2
+                else:
+                    masked_actions[env_idx, agent_idx, 0] = 1
+
+        return masked_actions
+
     def load(self):
         self.obs_space = self.envs.observation_space
         self.share_obs_space = self.envs.share_observation_space
@@ -141,7 +180,17 @@ class ShareJSBSimRunner(Runner):
         # split parallel data [N*M, shape] => [N, M, shape]
         values = np.array(np.split(_t2n(values), self.n_rollout_threads))
         actions = np.array(np.split(_t2n(actions), self.n_rollout_threads))
-        action_log_probs = np.array(np.split(_t2n(action_log_probs), self.n_rollout_threads))
+        actions = self._action_masking(self.buffer.obs[step], actions)
+        _, masked_action_log_probs, _ = self.policy.evaluate_actions(
+            np.concatenate(self.buffer.share_obs[step]),
+            np.concatenate(self.buffer.obs[step]),
+            np.concatenate(self.buffer.rnn_states_actor[step]),
+            np.concatenate(self.buffer.rnn_states_critic[step]),
+            np.concatenate(actions),
+            np.concatenate(self.buffer.masks[step]),
+            None,
+        )
+        action_log_probs = np.array(np.split(_t2n(masked_action_log_probs), self.n_rollout_threads))
         rnn_states_actor = np.array(np.split(_t2n(rnn_states_actor), self.n_rollout_threads))
         rnn_states_critic = np.array(np.split(_t2n(rnn_states_critic), self.n_rollout_threads))
 
