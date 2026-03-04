@@ -115,4 +115,5 @@ If you find this repo useful, pleased use the following citation:
 4) 교전 중 이벤트(아군 격추/무장 고갈) 발생 시 LLM이 RTB 여부를 판단
 5) 각 교전 환경 ID/지역/상태를 DB에 실시간 누적하고 LLM이 TOOL로 조회
 6) 웹 대시보드에서 교전중 지역은 투명 빨강으로, 이동중 편대는 아군/적군 원형으로 실시간 표시
+- 2v2 교전은 `renders/render_2v2.py` 방식과 동일하게 아군/적군 정책(`actor_<index>.pt`)을 각각 로드해 수행 가능 (`run_air_commander_system.py`의 `--ego-policy-dir`, `--enm-policy-dir`, `--ego-policy-index`, `--enm-policy-index`)
 

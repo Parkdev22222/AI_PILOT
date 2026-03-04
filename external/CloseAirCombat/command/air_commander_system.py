@@ -5,9 +5,27 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
+from algorithms.ppo.ppo_actor import PPOActor
 from envs.JSBSim.envs import MultipleCombatEnv
 from .commander_db import CommanderCombatDB
+
+
+class _PolicyArgs:
+    """Minimal actor args compatible with renders/render_2v2.py."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.gain = 0.01
+        self.hidden_size = "128 128"
+        self.act_hidden_size = "128 128"
+        self.activation_id = 1
+        self.use_feature_normalization = False
+        self.use_recurrent_policy = True
+        self.recurrent_hidden_size = 128
+        self.recurrent_hidden_layers = 1
+        self.tpdv = dict(dtype=torch.float32, device=device)
+        self.use_prior = True
 
 
 @dataclass
@@ -37,7 +55,6 @@ class AirTrack:
         lat = float(self.lon_lat[1])
         dlat = north_km / 111.0
         dlon = east_km / max(111.0 * math.cos(math.radians(lat)), 1e-6)
-
         self.lon_lat = self.lon_lat + np.array([dlon, dlat], dtype=np.float64)
 
 
@@ -48,6 +65,9 @@ class Engagement:
     env: MultipleCombatEnv
     allies: List[AirTrack] = field(default_factory=list)
     enemies: List[AirTrack] = field(default_factory=list)
+    obs: Optional[np.ndarray] = None
+    ego_rnn_states: Optional[np.ndarray] = None
+    enm_rnn_states: Optional[np.ndarray] = None
 
 
 class Exaone4CommanderAgent:
@@ -97,11 +117,25 @@ class KoreaAirCommanderSystem:
         db_path: str,
         scenario_name: str = "2v2/NoWeapon/HierarchySelfplay",
         model_id: str = "exaone4",
+        ego_policy_dir: str = "",
+        enm_policy_dir: str = "",
+        ego_policy_index: str = "latest",
+        enm_policy_index: str = "latest",
+        policy_device: str = "cpu",
     ):
         self.db = CommanderCombatDB(db_path)
         self.run_id = f"korea_commander_{int(time.time())}"
         self.scenario_name = scenario_name
         self.commander = Exaone4CommanderAgent(self.db, model_id=model_id)
+
+        self.ego_policy_dir = ego_policy_dir
+        self.enm_policy_dir = enm_policy_dir
+        self.ego_policy_index = str(ego_policy_index)
+        self.enm_policy_index = str(enm_policy_index)
+        self.policy_device = torch.device(policy_device)
+        self._policy_args = _PolicyArgs(self.policy_device)
+        self._ego_policy: Optional[PPOActor] = None
+        self._enm_policy: Optional[PPOActor] = None
 
         self.bases: Dict[str, BaseState] = {
             "Seosan": BaseState("Seosan", (126.5, 36.7), ready_fighters=8),
@@ -135,6 +169,22 @@ class KoreaAirCommanderSystem:
         self._activate_engagements_if_needed()
         self._step_active_engagements()
         self._log_live_tracks()
+
+    def _load_policies_if_needed(self, env: MultipleCombatEnv):
+        if self._ego_policy is not None and self._enm_policy is not None:
+            return
+        if not self.ego_policy_dir or not self.enm_policy_dir:
+            return
+
+        self._ego_policy = PPOActor(self._policy_args, env.observation_space, env.action_space, device=self.policy_device)
+        self._enm_policy = PPOActor(self._policy_args, env.observation_space, env.action_space, device=self.policy_device)
+        self._ego_policy.eval()
+        self._enm_policy.eval()
+
+        ego_path = os.path.join(self.ego_policy_dir, f"actor_{self.ego_policy_index}.pt")
+        enm_path = os.path.join(self.enm_policy_dir, f"actor_{self.enm_policy_index}.pt")
+        self._ego_policy.load_state_dict(torch.load(ego_path, map_location=self.policy_device))
+        self._enm_policy.load_state_dict(torch.load(enm_path, map_location=self.policy_device))
 
     def _launch_interceptors(self):
         for enemy in self.enemy_tracks.values():
@@ -189,8 +239,27 @@ class KoreaAirCommanderSystem:
             region = self._region_name(midpoint)
             os.environ.setdefault("CLOSEAIRCOMBAT_TELEMETRY_DB", self.db.db_path)
             env = MultipleCombatEnv(self.scenario_name)
-            env.reset()
-            self.engagements[env_id] = Engagement(env_id=env_id, region=region, env=env, allies=[friendly], enemies=[enemy])
+            obs, _ = env.reset()
+            self._load_policies_if_needed(env)
+
+            n_side = env.num_agents // 2
+            engagement = Engagement(
+                env_id=env_id,
+                region=region,
+                env=env,
+                allies=[friendly],
+                enemies=[enemy],
+                obs=obs,
+                ego_rnn_states=np.zeros(
+                    (n_side, self._policy_args.recurrent_hidden_layers, self._policy_args.recurrent_hidden_size),
+                    dtype=np.float32,
+                ),
+                enm_rnn_states=np.zeros(
+                    (n_side, self._policy_args.recurrent_hidden_layers, self._policy_args.recurrent_hidden_size),
+                    dtype=np.float32,
+                ),
+            )
+            self.engagements[env_id] = engagement
             self.db.log_event(
                 run_id=self.run_id,
                 global_step=self.global_step,
@@ -200,11 +269,31 @@ class KoreaAirCommanderSystem:
                 event_payload={"distance_km": dist_km},
             )
 
+    def _get_policy_actions(self, engagement: Engagement) -> np.ndarray:
+        env = engagement.env
+        if self._ego_policy is None or self._enm_policy is None or engagement.obs is None:
+            return np.zeros((env.num_agents, 4), dtype=np.int64)
+
+        n_side = env.num_agents // 2
+        masks = np.ones((n_side, 1), dtype=np.float32)
+        ego_obs = engagement.obs[:n_side, ...]
+        enm_obs = engagement.obs[n_side:, ...]
+
+        with torch.no_grad():
+            ego_actions, _, ego_rnn = self._ego_policy(ego_obs, engagement.ego_rnn_states, masks, deterministic=True)
+            enm_actions, _, enm_rnn = self._enm_policy(enm_obs, engagement.enm_rnn_states, masks, deterministic=True)
+
+        engagement.ego_rnn_states = ego_rnn.detach().cpu().numpy()
+        engagement.enm_rnn_states = enm_rnn.detach().cpu().numpy()
+        actions = np.concatenate([ego_actions.detach().cpu().numpy(), enm_actions.detach().cpu().numpy()], axis=0)
+        return actions.astype(np.int64)
+
     def _step_active_engagements(self):
         for env_id, engagement in list(self.engagements.items()):
-            env = engagement.env
-            action = np.zeros((env.num_agents, 4), dtype=np.int64)
-            _, _, _, dones, info = env.step(action)
+            action = self._get_policy_actions(engagement)
+            obs, _, _, dones, info = engagement.env.step(action)
+            engagement.obs = obs
+
             battle_snapshot = info.get("battle_snapshot", {"allies": [], "enemies": []})
             self.db.log_engagement_snapshot(
                 run_id=self.run_id,
@@ -224,7 +313,7 @@ class KoreaAirCommanderSystem:
                     event_type="ENGAGEMENT_END",
                     event_payload={"reason": "env_done"},
                 )
-                env.close()
+                engagement.env.close()
                 del self.engagements[env_id]
 
     def _log_live_tracks(self):
@@ -238,28 +327,32 @@ class KoreaAirCommanderSystem:
         rows = []
         for tid, t in self.friendly_tracks.items():
             env_ref = engaged_pairs.get(tid)
-            rows.append({
-                "track_id": tid,
-                "team": "ally",
-                "group_id": self._group_id_from_track(tid),
-                "lon": float(t.lon_lat[0]),
-                "lat": float(t.lon_lat[1]),
-                "status": "ENGAGED" if env_ref else "TRANSIT",
-                "env_id": env_ref[0] if env_ref else "",
-                "region": env_ref[1] if env_ref else "",
-            })
+            rows.append(
+                {
+                    "track_id": tid,
+                    "team": "ally",
+                    "group_id": self._group_id_from_track(tid),
+                    "lon": float(t.lon_lat[0]),
+                    "lat": float(t.lon_lat[1]),
+                    "status": "ENGAGED" if env_ref else "TRANSIT",
+                    "env_id": env_ref[0] if env_ref else "",
+                    "region": env_ref[1] if env_ref else "",
+                }
+            )
         for tid, t in self.enemy_tracks.items():
             env_ref = engaged_pairs.get(tid)
-            rows.append({
-                "track_id": tid,
-                "team": "enemy",
-                "group_id": tid,
-                "lon": float(t.lon_lat[0]),
-                "lat": float(t.lon_lat[1]),
-                "status": "ENGAGED" if env_ref else "TRANSIT",
-                "env_id": env_ref[0] if env_ref else "",
-                "region": env_ref[1] if env_ref else "",
-            })
+            rows.append(
+                {
+                    "track_id": tid,
+                    "team": "enemy",
+                    "group_id": tid,
+                    "lon": float(t.lon_lat[0]),
+                    "lat": float(t.lon_lat[1]),
+                    "status": "ENGAGED" if env_ref else "TRANSIT",
+                    "env_id": env_ref[0] if env_ref else "",
+                    "region": env_ref[1] if env_ref else "",
+                }
+            )
 
         self.db.log_tracks(self.run_id, self.global_step, rows)
 
@@ -287,10 +380,7 @@ class KoreaAirCommanderSystem:
         candidates = [b for b in self.bases.values() if b.ready_fighters > 0]
         if not candidates:
             return None
-        return min(
-            candidates,
-            key=lambda b: self._haversine_km(tuple(enemy_lon_lat), b.lon_lat),
-        )
+        return min(candidates, key=lambda b: self._haversine_km(tuple(enemy_lon_lat), b.lon_lat))
 
     def _has_assigned_friendly(self, enemy_track_id: str) -> bool:
         return any(tid.endswith(f"_{enemy_track_id}") for tid in self.friendly_tracks.keys())

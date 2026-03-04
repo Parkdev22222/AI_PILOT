@@ -16,6 +16,11 @@ def parse_args():
     parser.add_argument("--model-id", type=str, default="exaone4")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--dt-seconds", type=float, default=10.0)
+    parser.add_argument("--ego-policy-dir", type=str, default="")
+    parser.add_argument("--enm-policy-dir", type=str, default="")
+    parser.add_argument("--ego-policy-index", type=str, default="latest")
+    parser.add_argument("--enm-policy-index", type=str, default="latest")
+    parser.add_argument("--policy-device", type=str, default="cpu")
     return parser.parse_args()
 
 
@@ -25,6 +30,11 @@ def main():
         db_path=args.db_path,
         scenario_name=args.scenario_name,
         model_id=args.model_id,
+        ego_policy_dir=args.ego_policy_dir,
+        enm_policy_dir=args.enm_policy_dir,
+        ego_policy_index=args.ego_policy_index,
+        enm_policy_index=args.enm_policy_index,
+        policy_device=args.policy_device,
     )
 
     # Example: multiple enemy aircraft descending from different directions.
