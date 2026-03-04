@@ -183,6 +183,54 @@ class CommanderCombatDB:
                 (run_id, latest_step),
             ).fetchall()
 
+            raw_events = conn.execute(
+                """
+                SELECT global_step, event_type, env_id, region, event_payload
+                FROM commander_events
+                WHERE run_id = ? AND global_step >= ?
+                ORDER BY global_step DESC
+                LIMIT 30
+                """,
+                (run_id, max(0, latest_step - 20)),
+            ).fetchall()
+
+            shotdown_rows = conn.execute(
+                """
+                SELECT team, unit_id, env_id, region
+                FROM commander_engagement_telemetry
+                WHERE run_id = ? AND global_step = ? AND is_shotdown = 1
+                """,
+                (run_id, latest_step),
+            ).fetchall()
+
+        events = []
+        for step, event_type, env_id, region, payload_text in raw_events:
+            payload = {}
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                payload = {"raw": payload_text}
+            events.append(
+                {
+                    "step": int(step),
+                    "event_type": event_type,
+                    "env_id": env_id,
+                    "region": region,
+                    "payload": payload,
+                }
+            )
+
+        for team, unit_id, env_id, region in shotdown_rows:
+            events.append(
+                {
+                    "step": latest_step,
+                    "event_type": "ALLY_SHOTDOWN" if team == "allies" else "ENEMY_SHOTDOWN",
+                    "env_id": env_id,
+                    "region": region,
+                    "payload": {"unit_id": unit_id},
+                }
+            )
+
         return {
             "run_id": run_id,
             "global_step": latest_step,
@@ -208,6 +256,7 @@ class CommanderCombatDB:
                 }
                 for r in engagement_rows
             ],
+            "events": events,
         }
 
     def _snapshot_rows(
