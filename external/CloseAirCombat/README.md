@@ -98,3 +98,69 @@ If you find this repo useful, pleased use the following citation:
   journal = {GitHub repository},
   howpublished = {\url{https://github.com/liuqh16/CloseAirCombat}},
 }
+
+
+## Air Commander LLM System (New)
+- `command/air_commander_system.py`: 엑사원4 기반 공군 지휘관 에이전트 + 다중 기지 출격/다중 지역 교전 생성 오케스트레이터
+- `command/commander_db.py`: 실시간 교전 DB 저장 모듈 (환경 ID, 교전 지역, 아군/적군 위치, 격추 여부, 잔여 무장량)
+- `scripts/command/run_air_commander_system.py`: 다방향 적기 남하 시나리오를 실행하고 거리 40km 이내 시 `MultipleCombatEnv`를 생성
+- `scripts/command/query_commander_rag.py`: EXAONE4 에이전트가 DB 조회 TOOL(RAG)로 상황 질의
+- `scripts/command/run_commander_web.py`: DB 실시간 상태 API(`/api/live_state`)와 한반도 지도 웹 대시보드를 제공하는 서버 스크립트
+- `web/command_dashboard/index.html`: 교전 지역(투명 빨강) + 이동중 편대(아군/적군 원형) 실시간 시각화 페이지
+
+시스템 개요:
+1) LLM이 한반도 전역 적기 남하 경로를 보고 출격 기지를 결정
+2) 아군/적군이 시속 2000km로 접근
+3) 거리 40km 이내에서 지역별 `MultipleCombatEnv`가 동시 생성
+4) 교전 중 이벤트(아군 격추/무장 고갈) 발생 시 LLM이 RTB 여부를 판단
+5) 각 교전 환경 ID/지역/상태를 DB에 실시간 누적하고 LLM이 TOOL로 조회
+6) 웹 대시보드에서 교전중 지역은 투명 빨강으로, 이동중 편대는 아군/적군 원형으로 실시간 표시
+
+
+### Air Commander 실행 방법
+1. 지휘 시뮬레이션 실행 (DB 생성 + run_id 출력)
+```bash
+cd external/CloseAirCombat
+python scripts/command/run_air_commander_system.py \
+  --db-path /tmp/commander_live.db \
+  --scenario-name "2v2/NoWeapon/HierarchySelfplay" \
+  --steps 300 \
+  --dt-seconds 10 \
+  --ego-policy-dir /path/to/ego_policy_dir \
+  --enm-policy-dir /path/to/enm_policy_dir \
+  --ego-policy-index latest \
+  --enm-policy-index latest \
+  --policy-device cpu \
+  --local-exaone-path /path/to/local/exaone4 \
+  --local-exaone-device cpu
+```
+- 정책 경로를 주지 않으면 교전 단계는 기본 fallback action으로 동작합니다.
+- 실행 로그에서 `run_id=...` 값을 확인합니다.
+- 로컬 EXAONE4를 사용하려면 `transformers` 설치 후 `--local-exaone-path`에 로컬 모델 경로를 지정합니다.
+
+2. 실시간 지도 웹 대시보드 실행
+```bash
+cd external/CloseAirCombat
+python scripts/command/run_commander_web.py \
+  --db-path /tmp/commander_live.db \
+  --run-id <위에서 출력된 run_id> \
+  --host 0.0.0.0 \
+  --port 8088
+```
+- 브라우저에서 `http://localhost:8088` 접속
+- 교전중 지역: 투명 빨강 오버레이
+- 이동중 편대: 아군/적군 원형 마커
+
+3. EXAONE4 RAG 질의 실행
+```bash
+cd external/CloseAirCombat
+python scripts/command/query_commander_rag.py \
+  --db-path /tmp/commander_live.db \
+  --model-id exaone4 \
+  --local-exaone-path /path/to/local/exaone4 \
+  --local-exaone-device cpu \
+  --prompt "현재 교전 중인 지역과 아군 손실 현황을 요약해줘"
+```
+
+- 2v2 교전은 `renders/render_2v2.py` 방식과 동일하게 아군/적군 정책(`actor_<index>.pt`)을 각각 로드해 수행 가능 (`run_air_commander_system.py`의 `--ego-policy-dir`, `--enm-policy-dir`, `--ego-policy-index`, `--enm-policy-index`)
+
