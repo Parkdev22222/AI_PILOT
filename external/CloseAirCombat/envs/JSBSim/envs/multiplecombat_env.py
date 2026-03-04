@@ -71,7 +71,10 @@ class MultipleCombatEnv(BaseEnv):
         # apply actions
         action = self._unpack(action)
         for agent_id in self.agents.keys():
-            a_action = self.task.normalize_action(self, agent_id, action[agent_id])
+            agent_action = action[agent_id]
+            if hasattr(self.task, "mask_action"):
+                agent_action = self.task.mask_action(self, agent_id, agent_action)
+            a_action = self.task.normalize_action(self, agent_id, agent_action)
             self.agents[agent_id].set_property_values(self.task.action_var, a_action)
         # run simulation
         for _ in range(self.agent_interaction_steps):
