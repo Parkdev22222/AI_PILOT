@@ -86,6 +86,11 @@ class BaseEnv(gymnasium.Env):
 
         self._tempsims = {}    # type: Dict[str, BaseSimulator]
 
+    def _update_radars(self):
+        targets = list(self._jsbsims.values()) + [sim for sim in self._tempsims.values() if isinstance(sim, BaseSimulator)]
+        for sim in self._jsbsims.values():
+            sim.update_radar(targets)
+
     def add_temp_simulator(self, sim: BaseSimulator):
         self._tempsims[sim.uid] = sim
 
@@ -100,6 +105,7 @@ class BaseEnv(gymnasium.Env):
         for sim in self._jsbsims.values():
             sim.reload()
         self._tempsims.clear()
+        self._update_radars()
         # reset task
         self.task.reset(self)
         obs = self.get_obs()
@@ -122,19 +128,28 @@ class BaseEnv(gymnasium.Env):
                 info: auxiliary information
         """
         self.current_step += 1
-        info = {"current_step": self.current_step}
+        info = {"current_step": self.current_step, "temp_sim_events": []}
+        info["battle_snapshot"] = self._build_battle_snapshot()
         # apply actions
         action = self._unpack(action)
         for agent_id in self.agents.keys():
-            a_action = self.task.normalize_action(self, agent_id, action[agent_id])
+            agent_action = action[agent_id]
+            if hasattr(self.task, "mask_action"):
+                agent_action = self.task.mask_action(self, agent_id, agent_action)
+            a_action = self.task.normalize_action(self, agent_id, agent_action)
             self.agents[agent_id].set_property_values(self.task.action_var, a_action)
         # run simulation
         for _ in range(self.agent_interaction_steps):
             for sim in self._jsbsims.values():
-                sim.run()
+                sim_event = sim.run()
+                if sim_event is not None:
+                    info["temp_sim_events"].append(sim_event)
             for sim in self._tempsims.values():
-                sim.run()
+                sim_event = sim.run()
+                if sim_event is not None:
+                    info["temp_sim_events"].append(sim_event)
         self.task.step(self)
+        self._update_radars()
 
         obs = self.get_obs()
 
@@ -149,6 +164,22 @@ class BaseEnv(gymnasium.Env):
             rewards[agent_id] = [reward]
 
         return self._pack(obs), self._pack(rewards), self._pack(dones), info
+
+
+    def _build_battle_snapshot(self):
+        snapshot = {"allies": [], "enemies": []}
+        for uid, sim in self._jsbsims.items():
+            unit = {
+                "uid": uid,
+                "position": np.array(sim.get_position(), dtype=np.float64).tolist(),
+                "is_shotdown": bool(sim.is_shotdown),
+                "missiles_remaining": int(getattr(sim, "num_left_missiles", 0)),
+            }
+            if uid in self.ego_ids:
+                snapshot["allies"].append(unit)
+            else:
+                snapshot["enemies"].append(unit)
+        return snapshot
 
     def get_obs(self):
         """Returns all agent observations in a list.
