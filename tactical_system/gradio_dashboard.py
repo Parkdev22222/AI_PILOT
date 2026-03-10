@@ -470,128 +470,62 @@ class TacticalDashboard:
         return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
-    # 상태 요약 HTML (생존 카운터)
+    # 상태 요약: 정적 골격 (최초 1회 렌더) + 데이터 JSON (타이머마다 갱신)
     # ------------------------------------------------------------------
 
-    def _make_status_html(self) -> str:
-        states = self._states()
-        if not states:
-            return "<div class='status-box'>시뮬레이션 데이터 대기 중...</div>"
-
-        alive_f = sum(1 for s in states if s["team"] == "friendly" and s["is_alive"])
-        total_f = sum(1 for s in states if s["team"] == "friendly")
-        alive_e = sum(1 for s in states if s["team"] == "enemy"    and s["is_alive"])
-        total_e = sum(1 for s in states if s["team"] == "enemy")
-        step    = max((s.get("step", 0) for s in states), default=0)
-
-        bar_f = int(alive_f / max(total_f, 1) * 100)
-        bar_e = int(alive_e / max(total_e, 1) * 100)
-
-        return f"""
+    @staticmethod
+    def _make_status_skeleton() -> str:
+        return """
 <div class='status-box'>
-  <div class='status-title'>📡 전투 현황 (스텝: {step})</div>
+  <div class='status-title'>📡 전투 현황 (스텝: <span id='s-step'>-</span>)</div>
   <table class='status-tbl'>
     <tr>
       <td class='blue-text'>🔵 아군</td>
       <td>
         <div class='bar-wrap'>
-          <div class='bar-fill blue-bar' style='width:{bar_f}%'></div>
+          <div class='bar-fill blue-bar' id='s-bar-f' style='width:0%'></div>
         </div>
       </td>
-      <td class='cnt blue-text'>{alive_f}/{total_f}</td>
+      <td class='cnt blue-text' id='s-cnt-f'>-/-</td>
     </tr>
     <tr>
       <td class='red-text'>🔴 적군</td>
       <td>
         <div class='bar-wrap'>
-          <div class='bar-fill red-bar' style='width:{bar_e}%'></div>
+          <div class='bar-fill red-bar' id='s-bar-e' style='width:0%'></div>
         </div>
       </td>
-      <td class='cnt red-text'>{alive_e}/{total_e}</td>
+      <td class='cnt red-text' id='s-cnt-e'>-/-</td>
     </tr>
   </table>
-</div>
-"""
+</div>"""
+
+    def _make_status_data(self) -> str:
+        """JS가 읽을 JSON 문자열 반환 — DOM 직접 갱신에 사용."""
+        states = self._states()
+        if not states:
+            return json.dumps({"step": "-", "bar_f": 0, "bar_e": 0,
+                               "cnt_f": "-/-", "cnt_e": "-/-"})
+        alive_f = sum(1 for s in states if s["team"] == "friendly" and s["is_alive"])
+        total_f = sum(1 for s in states if s["team"] == "friendly")
+        alive_e = sum(1 for s in states if s["team"] == "enemy"    and s["is_alive"])
+        total_e = sum(1 for s in states if s["team"] == "enemy")
+        step    = max((s.get("step", 0) for s in states), default=0)
+        return json.dumps({
+            "step":  step,
+            "bar_f": int(alive_f / max(total_f, 1) * 100),
+            "bar_e": int(alive_e / max(total_e, 1) * 100),
+            "cnt_f": f"{alive_f}/{total_f}",
+            "cnt_e": f"{alive_e}/{total_e}",
+        })
 
     # ------------------------------------------------------------------
-    # 이벤트 로그 HTML (스크롤 가능)
+    # 이벤트 로그: 정적 골격 (최초 1회) + 행 HTML (타이머마다 갱신)
     # ------------------------------------------------------------------
 
-    def _make_event_html(self) -> str:
-        events = self._events()
-
-        rows_html = ""
-        if not events:
-            rows_html = "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>"
-        else:
-            for e in events:
-                etype   = _EVENT_TYPE_KO.get(e.get("event_type", ""), e.get("event_type", "-"))
-                details = e.get("details_json", {})
-                dec     = e.get("llm_decision") or {}
-
-                if isinstance(details, dict):
-                    if "loss_ratio" in details:
-                        detail_str = (
-                            f"생존 {details.get('alive_friendly','?')}/"
-                            f"{details.get('total_friendly','?')}대 "
-                            f"({details['loss_ratio']*100:.0f}% 손실)"
-                        )
-                    elif "aircraft_uid" in details:
-                        detail_str = f"{details['aircraft_uid']} 무장 고갈"
-                    else:
-                        detail_str = str(details)[:60]
-                else:
-                    detail_str = str(details)[:60]
-
-                action_ko = {
-                    "rtb":             "전체 RTB",
-                    "request_support": "지원 요청",
-                    "continue":        "임무 지속",
-                }.get(dec.get("action", ""), dec.get("action", "-") if dec else "-")
-
-                resolved_badge = (
-                    "<span class='badge-ok'>완료</span>"
-                    if e.get("resolved")
-                    else "<span class='badge-wait'>대기</span>"
-                )
-                type_class = "event-loss" if "손실" in etype else "event-ammo"
-
-                rows_html += (
-                    f"<tr>"
-                    f"<td>{e.get('step','-')}</td>"
-                    f"<td class='{type_class}'>{etype}</td>"
-                    f"<td>{detail_str}</td>"
-                    f"<td>{action_ko}</td>"
-                    f"<td>{resolved_badge}</td>"
-                    f"</tr>\n"
-                )
-
-        # sessionStorage 기반 스크롤 위치 보존 + 맨 아래일 때 자동 스크롤
-        scroll_js = """
-<script>
-(function(){
-  var el = document.getElementById('ev-scroll');
-  if (!el) return;
-  var saved   = sessionStorage.getItem('evScroll');
-  var atBot   = sessionStorage.getItem('evAtBottom') !== '0';
-  function restore() {
-    if (atBot) {
-      el.scrollTop = el.scrollHeight;
-    } else if (saved !== null) {
-      el.scrollTop = parseInt(saved, 10);
-    }
-    el.addEventListener('scroll', function() {
-      sessionStorage.setItem('evScroll', el.scrollTop);
-      var isBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-      sessionStorage.setItem('evAtBottom', isBot ? '1' : '0');
-    }, {passive: true});
-  }
-  if (el.scrollHeight > 0) { restore(); }
-  else { requestAnimationFrame(restore); }
-})();
-</script>"""
-
-        return f"""
+    @staticmethod
+    def _make_event_skeleton() -> str:
+        return """
 <div class='event-wrapper'>
   <div class='event-header'>🚨 이벤트 로그</div>
   <div class='event-scroll' id='ev-scroll'>
@@ -602,13 +536,62 @@ class TacticalDashboard:
           <th>LLM 결정</th><th>처리</th>
         </tr>
       </thead>
-      <tbody>
-{rows_html}
+      <tbody id='ev-tbody'>
+        <tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>
       </tbody>
     </table>
   </div>
-</div>
-{scroll_js}"""
+</div>"""
+
+    def _make_event_rows(self) -> str:
+        """<tbody> 내부 <tr> 행들만 반환 — JS가 ev-tbody.innerHTML에 삽입."""
+        events = self._events()
+        if not events:
+            return "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>"
+
+        rows_html = ""
+        for e in events:
+            etype   = _EVENT_TYPE_KO.get(e.get("event_type", ""), e.get("event_type", "-"))
+            details = e.get("details_json", {})
+            dec     = e.get("llm_decision") or {}
+
+            if isinstance(details, dict):
+                if "loss_ratio" in details:
+                    detail_str = (
+                        f"생존 {details.get('alive_friendly','?')}/"
+                        f"{details.get('total_friendly','?')}대 "
+                        f"({details['loss_ratio']*100:.0f}% 손실)"
+                    )
+                elif "aircraft_uid" in details:
+                    detail_str = f"{details['aircraft_uid']} 무장 고갈"
+                else:
+                    detail_str = str(details)[:60]
+            else:
+                detail_str = str(details)[:60]
+
+            action_ko = {
+                "rtb":             "전체 RTB",
+                "request_support": "지원 요청",
+                "continue":        "임무 지속",
+            }.get(dec.get("action", ""), dec.get("action", "-") if dec else "-")
+
+            resolved_badge = (
+                "<span class='badge-ok'>완료</span>"
+                if e.get("resolved")
+                else "<span class='badge-wait'>대기</span>"
+            )
+            type_class = "event-loss" if "손실" in etype else "event-ammo"
+
+            rows_html += (
+                f"<tr>"
+                f"<td>{e.get('step','-')}</td>"
+                f"<td class='{type_class}'>{etype}</td>"
+                f"<td>{detail_str}</td>"
+                f"<td>{action_ko}</td>"
+                f"<td>{resolved_badge}</td>"
+                f"</tr>\n"
+            )
+        return rows_html
 
     # ------------------------------------------------------------------
     # 통합 갱신 콜백
@@ -617,8 +600,8 @@ class TacticalDashboard:
     def _refresh(self):
         return (
             self._make_map_figure(),
-            self._make_status_html(),
-            self._make_event_html(),
+            self._make_status_data(),   # JSON → hidden Textbox → JS DOM update
+            self._make_event_rows(),    # HTML rows → hidden Textbox → JS DOM update
         )
 
     # ------------------------------------------------------------------
@@ -776,6 +759,68 @@ class TacticalDashboard:
   obs.observe(document.body, { childList: true, subtree: true });
   var d = document.querySelector('.js-plotly-plot');
   if (d) setupMapListeners(d);
+
+  /* ── 상태·이벤트 in-place 업데이트 (깜빡임 없음) ──────────────────
+   * gr.Timer가 hidden Textbox 값을 갱신하면 300ms 내에 감지해
+   * 보이는 DOM 노드만 직접 수정한다 (전체 HTML 교체 없음).
+   */
+  var _lastStatus = '';
+  var _lastEvents = '';
+
+  // 이벤트 스크롤 리스너는 최초 1회만 등록
+  var _evScrollBound = false;
+  function _bindEvScroll() {
+    if (_evScrollBound) return;
+    var el = document.getElementById('ev-scroll');
+    if (!el) return;
+    _evScrollBound = true;
+    el.addEventListener('scroll', function() {
+      sessionStorage.setItem('evScroll', el.scrollTop);
+      var isBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      sessionStorage.setItem('evAtBottom', isBot ? '1' : '0');
+    }, {passive: true});
+  }
+
+  setInterval(function() {
+    /* ── 상태 업데이트 ── */
+    var stTa = document.querySelector('#status-carrier textarea');
+    if (stTa && stTa.value && stTa.value !== _lastStatus) {
+      _lastStatus = stTa.value;
+      try {
+        var d = JSON.parse(stTa.value);
+        var stepEl = document.getElementById('s-step');
+        var barF   = document.getElementById('s-bar-f');
+        var barE   = document.getElementById('s-bar-e');
+        var cntF   = document.getElementById('s-cnt-f');
+        var cntE   = document.getElementById('s-cnt-e');
+        if (stepEl) stepEl.textContent   = d.step;
+        if (barF)   barF.style.width     = d.bar_f + '%';
+        if (barE)   barE.style.width     = d.bar_e + '%';
+        if (cntF)   cntF.textContent     = d.cnt_f;
+        if (cntE)   cntE.textContent     = d.cnt_e;
+      } catch(e) {}
+    }
+
+    /* ── 이벤트 로그 업데이트 ── */
+    var evTa = document.querySelector('#events-carrier textarea');
+    if (evTa && evTa.value && evTa.value !== _lastEvents) {
+      _lastEvents = evTa.value;
+      var tbody = document.getElementById('ev-tbody');
+      if (tbody) {
+        tbody.innerHTML = evTa.value;
+        _bindEvScroll();
+        var scroll = document.getElementById('ev-scroll');
+        if (scroll) {
+          var atBot = sessionStorage.getItem('evAtBottom') !== '0';
+          if (atBot) scroll.scrollTop = scroll.scrollHeight;
+          else {
+            var saved = sessionStorage.getItem('evScroll');
+            if (saved !== null) scroll.scrollTop = parseInt(saved, 10);
+          }
+        }
+      }
+    }
+  }, 300);
 }
 """
         with gr.Blocks(
@@ -804,9 +849,13 @@ class TacticalDashboard:
                         show_label=False,
                     )
 
-                # 우측 패널: 상태 요약 + 범례
+                # 우측 패널: 상태 요약(정적 골격) + 범례
                 with gr.Column(scale=1, min_width=220):
-                    status_html = gr.HTML(elem_id="status-panel")
+                    # 정적 골격 — 타이머가 교체하지 않음, JS가 내부 노드만 갱신
+                    gr.HTML(
+                        value=self._make_status_skeleton(),
+                        elem_id="status-panel",
+                    )
 
                     gr.HTML(
                         """
@@ -829,14 +878,30 @@ class TacticalDashboard:
                         elem_classes=["legend-md"],
                     )
 
-            # ── 이벤트 로그 (스크롤 가능) ─────────────────────────────
-            event_html = gr.HTML(elem_id="event-log")
+            # ── 이벤트 로그 (정적 골격) ───────────────────────────────
+            # 타이머가 교체하지 않음, JS가 ev-tbody.innerHTML만 교체
+            gr.HTML(
+                value=self._make_event_skeleton(),
+                elem_id="event-log",
+            )
+
+            # ── 숨겨진 데이터 캐리어 (타이머 출력 대상) ──────────────
+            # JS가 300ms마다 폴링해 보이는 DOM 노드를 in-place 갱신
+            with gr.Row(visible=False):
+                status_carrier = gr.Textbox(
+                    value="", elem_id="status-carrier",
+                    interactive=False, show_label=False,
+                )
+                events_carrier = gr.Textbox(
+                    value="", elem_id="events-carrier",
+                    interactive=False, show_label=False, lines=3,
+                )
 
             # ── 자동 갱신 (gr.Timer) ───────────────────────────────────
             timer = gr.Timer(value=self.refresh_interval)
             timer.tick(
                 fn=self._refresh,
-                outputs=[map_plot, status_html, event_html],
+                outputs=[map_plot, status_carrier, events_carrier],
             )
 
         return demo
