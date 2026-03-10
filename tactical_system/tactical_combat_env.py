@@ -172,6 +172,61 @@ def _discrete_to_normalized(action_continuous: np.ndarray) -> np.ndarray:
     return np.clip(disc, 0, nvec - 1)
 
 
+def _autopilot_hierarchical_action(
+    sim: AircraftSimulator,
+    target_lon: float,
+    target_lat: float,
+    target_alt_m: float = CRUISE_ALT_M,
+) -> np.ndarray:
+    """
+    목표 지점을 향하는 고수준 계층적 행동 계산.
+
+    Returns
+    -------
+    np.ndarray shape (4,) : [alt_idx, hdg_idx, vel_idx, shoot_idx]
+    for MultiDiscrete([3, 5, 3, 2])
+      alt_idx  : 0=상승(+0.1) / 1=유지(0) / 2=하강(-0.1)
+      hdg_idx  : 0=좌-30° / 1=좌-15° / 2=직진 / 3=우+15° / 4=우+30°
+      vel_idx  : 0=가속(+0.05) / 1=유지 / 2=감속(-0.05)
+      shoot_idx: 0=미사격
+    """
+    lon, lat, alt = sim.get_geodetic()
+    _, _, heading = sim.get_rpy()   # rad
+
+    desired_heading = _bearing_rad(lon, lat, target_lon, target_lat)
+
+    # 헤딩 오차 (−π … π)
+    hdg_err = desired_heading - heading
+    while hdg_err > math.pi:
+        hdg_err -= 2 * math.pi
+    while hdg_err < -math.pi:
+        hdg_err += 2 * math.pi
+    hdg_err_deg = math.degrees(hdg_err)
+
+    # norm_delta_heading = [−π/6, −π/12, 0, π/12, π/6]
+    if hdg_err_deg < -15:
+        hdg_idx = 0
+    elif hdg_err_deg < -5:
+        hdg_idx = 1
+    elif hdg_err_deg <= 5:
+        hdg_idx = 2
+    elif hdg_err_deg <= 15:
+        hdg_idx = 3
+    else:
+        hdg_idx = 4
+
+    # norm_delta_altitude = [0.1, 0, −0.1]
+    alt_err = target_alt_m - alt
+    if alt_err > 200:
+        alt_idx = 0
+    elif alt_err < -200:
+        alt_idx = 2
+    else:
+        alt_idx = 1
+
+    return np.array([alt_idx, hdg_idx, 1, 0], dtype=np.int32)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 전술 전투 환경
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,32 +447,29 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             for uid in friendly_uids:
                 sim = self.agents[uid]
                 if not sim.is_alive:
-                    all_actions[uid] = np.array([20, 20, 20, 15], dtype=np.int32)
+                    all_actions[uid] = np.array([1, 2, 1, 0], dtype=np.int32)
                     continue
 
                 if uid in self.reload_pending:
                     # 기지로 귀환 중
                     home = self.reload_pending[uid]
-                    act_cont = compute_autopilot_action(
+                    all_actions[uid] = _autopilot_hierarchical_action(
                         sim, home["home_lon"], home["home_lat"])
-                    all_actions[uid] = _discrete_to_normalized(act_cont)
                 elif uid in self.reloaded_returning:
                     # 재장착 완료, 교전 지역 복귀 중
                     ret = self.reloaded_returning[uid]
-                    act_cont = compute_autopilot_action(
+                    all_actions[uid] = _autopilot_hierarchical_action(
                         sim, ret["combat_lon"], ret["combat_lat"])
-                    all_actions[uid] = _discrete_to_normalized(act_cont)
                 elif phase == "approach":
                     # 적 편대 중심으로 접근
                     tgt_lon, tgt_lat = self._formation_centroid(enemy_uids)
-                    act_cont = compute_autopilot_action(sim, tgt_lon, tgt_lat)
-                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                    all_actions[uid] = _autopilot_hierarchical_action(
+                        sim, tgt_lon, tgt_lat)
                 elif phase in ("rtb_loss",):
                     # 기지 복귀
                     base = pair["friendly_base"]
-                    act_cont = compute_autopilot_action(
+                    all_actions[uid] = _autopilot_hierarchical_action(
                         sim, base["lon"], base["lat"], target_alt_m=5000.0)
-                    all_actions[uid] = _discrete_to_normalized(act_cont)
                 elif phase == "support":
                     # 지원 요청 → 기존 잔존 기체는 계속 전투 (RL)
                     all_actions[uid] = self._rl_action_ego(uid)
@@ -434,12 +486,12 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             for uid in enemy_uids:
                 sim = self.agents[uid]
                 if not sim.is_alive:
-                    all_actions[uid] = np.array([20, 20, 20, 15], dtype=np.int32)
+                    all_actions[uid] = np.array([1, 2, 1, 0], dtype=np.int32)
                     continue
                 if phase == "approach":
                     tgt_lon, tgt_lat = self._formation_centroid(friendly_uids)
-                    act_cont = compute_autopilot_action(sim, tgt_lon, tgt_lat)
-                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                    all_actions[uid] = _autopilot_hierarchical_action(
+                        sim, tgt_lon, tgt_lat)
                 else:
                     all_actions[uid] = self._rl_action_enm(uid)
 
@@ -564,9 +616,8 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             enm_alive = [e for e in sim.enemies if e.is_alive]
             if enm_alive:
                 lon, lat, _ = enm_alive[0].get_geodetic()
-                act_cont = compute_autopilot_action(sim, lon, lat)
-                return _discrete_to_normalized(act_cont)
-            return np.array([20, 20, 20, 15], dtype=np.int32)
+                return _autopilot_hierarchical_action(sim, lon, lat)
+            return np.array([1, 2, 1, 0], dtype=np.int32)
 
         obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
         obs_t = torch.from_numpy(obs_arr).float().to(self.device)
@@ -584,9 +635,8 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             enm_alive = [e for e in sim.enemies if e.is_alive]
             if enm_alive:
                 lon, lat, _ = enm_alive[0].get_geodetic()
-                act_cont = compute_autopilot_action(sim, lon, lat)
-                return _discrete_to_normalized(act_cont)
-            return np.array([20, 20, 20, 15], dtype=np.int32)
+                return _autopilot_hierarchical_action(sim, lon, lat)
+            return np.array([1, 2, 1, 0], dtype=np.int32)
 
         obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
         obs_t = torch.from_numpy(obs_arr).float().to(self.device)
