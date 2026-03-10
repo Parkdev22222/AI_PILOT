@@ -34,6 +34,7 @@ if _CAC_ROOT not in sys.path:
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv_LLM
 from envs.JSBSim.core.simulatior import AircraftSimulator, MissileSimulator
 from envs.JSBSim.core.catalog import Catalog as c
+from envs.JSBSim.utils.utils import LLA2NEU, get_AO_TA_R
 from algorithms.mappo.ppo_actor import PPOActor
 
 from .combat_db import CombatDB
@@ -46,6 +47,10 @@ SUPPORT_SPAWN_ALT_M = 6_000      # 지원 편대 스폰 고도 (m)
 CRUISE_SPEED_FPS    = 800.0      # 순항 속도 (ft/s ≈ 244 m/s)
 CRUISE_ALT_M        = 6_000.0    # 순항 고도 (m)
 RELOAD_MISSILES     = 5          # 재장착 미사일 수
+
+NUM_NEAREST_ENEMIES = 2          # 관측에 포함할 최근접 적 기체 수
+# obs_length = 9(ego) + 6*(1파트너 + NUM_NEAREST_ENEMIES + 1미사일슬롯) = 33
+_OBS_LENGTH = 9 + (1 + NUM_NEAREST_ENEMIES + 1) * 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,16 +305,9 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             recurrent_hidden_layers = 1
             tpdv = dict(dtype=torch.float32, device=torch.device("cpu"))
 
-        # 체크포인트에서 실제 obs_dim 추출하여 모델 구조 맞춤
-        ckpt = torch.load(path, map_location=self.device)
-        ckpt_obs_dim = ckpt["base.mlp.fc.0.weight"].shape[1]
-        from gymnasium import spaces as gym_spaces
-        obs_space = gym_spaces.Box(low=-10, high=10., shape=(ckpt_obs_dim,))
-
-        policy = PPOActor(_Args(), obs_space, self.action_space,
+        policy = PPOActor(_Args(), self.observation_space, self.action_space,
                           device=self.device)
-        policy.load_state_dict(ckpt)
-        policy._ckpt_obs_dim = ckpt_obs_dim  # 추론 시 obs 자르기에 사용
+        policy.load_state_dict(torch.load(path, map_location=self.device))
         policy.eval()
         return policy
 
@@ -448,17 +446,102 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         ordered = [all_actions[uid] for uid in self.ego_ids + self.enm_ids]
         return np.array(ordered, dtype=np.int32)
 
-    def _adapt_obs(self, obs: np.ndarray, policy) -> np.ndarray:
+    # ------------------------------------------------------------------
+    # 관측 공간 오버라이드 (파트너 1기 + 최근접 적 2기 + 미사일 슬롯)
+    # ------------------------------------------------------------------
+
+    def _update_obs_space(self):
+        """obs_length = 9 + (1파트너 + NUM_NEAREST_ENEMIES + 1미사일) * 6 = 33 고정."""
+        from gymnasium import spaces as gym_spaces
+        self._obs_length = _OBS_LENGTH
+        self.task.obs_length = self._obs_length
+        self.task.observation_space = gym_spaces.Box(
+            low=-10, high=10., shape=(self._obs_length,))
+        self.task.share_observation_space = gym_spaces.Box(
+            low=-10, high=10., shape=(self.num_agents * self._obs_length,))
+
+    def _get_paired_obs(self, agent_id: str) -> np.ndarray:
         """
-        env obs(39dim)를 체크포인트 obs_dim에 맞게 조정.
-        LLM env는 [0:9] ego + [9:15] partner + [15:] enemies 구조이므로
-        partner 슬롯을 제거하면 원래 학습 obs와 일치함.
+        HierarchicalMultipleCombatShootTask.get_obs 구조를 따르되
+        적군은 ego 기준 가장 가까운 NUM_NEAREST_ENEMIES 기만 포함.
+
+        Layout (33 dim):
+          [0:9]   ego 상태
+          [9:15]  파트너 상대 정보 (없으면 zeros)
+          [15:21] 최근접 적1 상대 정보
+          [21:27] 최근접 적2 상대 정보 (없으면 zeros)
+          [27:33] 미사일 경고 정보 (없으면 zeros)
         """
-        ckpt_dim = getattr(policy, "_ckpt_obs_dim", obs.shape[-1])
-        if obs.shape[-1] == ckpt_dim:
-            return obs
-        # partner 슬롯([..., 9:15]) 제거
-        return np.concatenate([obs[..., :9], obs[..., 15:]], axis=-1)[..., :ckpt_dim]
+        norm_obs = np.zeros(self._obs_length)
+        state_var = self.task.state_var
+
+        # ── (1) ego ────────────────────────────────────────────────────
+        ego_state = np.array(
+            self.agents[agent_id].get_property_values(state_var))
+        ego_cur_ned = LLA2NEU(
+            *ego_state[:3], self.center_lon, self.center_lat, self.center_alt)
+        ego_feature = np.array([*ego_cur_ned, *(ego_state[6:9])])
+        norm_obs[0] = ego_state[2] / 5000
+        norm_obs[1] = np.sin(ego_state[3])
+        norm_obs[2] = np.cos(ego_state[3])
+        norm_obs[3] = np.sin(ego_state[4])
+        norm_obs[4] = np.cos(ego_state[4])
+        norm_obs[5] = ego_state[9] / 340
+        norm_obs[6] = ego_state[10] / 340
+        norm_obs[7] = ego_state[11] / 340
+        norm_obs[8] = ego_state[12] / 340
+
+        # ── (2) 파트너 + 최근접 적 2기 ────────────────────────────────
+        partner_id = self.partner_map.get(agent_id)
+        partner_sims = (
+            [self.agents[partner_id]]
+            if partner_id and partner_id in self.agents else []
+        )
+
+        ego_sim = self.agents[agent_id]
+        ego_lon, ego_lat, _ = ego_sim.get_geodetic()
+        alive_enemies = [e for e in ego_sim.enemies if e.is_alive]
+        alive_enemies.sort(
+            key=lambda e: _haversine_m(ego_lon, ego_lat, *e.get_geodetic()[:2]))
+        nearest_enemies = alive_enemies[:NUM_NEAREST_ENEMIES]
+
+        offset = 8
+        for target_sim in partner_sims + nearest_enemies:
+            state = np.array(target_sim.get_property_values(state_var))
+            cur_ned = LLA2NEU(
+                *state[:3], self.center_lon, self.center_lat, self.center_alt)
+            feature = np.array([*cur_ned, *(state[6:9])])
+            AO, TA, R, side_flag = get_AO_TA_R(ego_feature, feature, return_side=True)
+            norm_obs[offset + 1] = (state[9] - ego_state[9]) / 340
+            norm_obs[offset + 2] = (state[2] - ego_state[2]) / 1000
+            norm_obs[offset + 3] = AO
+            norm_obs[offset + 4] = TA
+            norm_obs[offset + 5] = R / 10000
+            norm_obs[offset + 6] = side_flag
+            offset += 6
+
+        norm_obs = np.clip(
+            norm_obs,
+            self.task.observation_space.low,
+            self.task.observation_space.high,
+        )
+
+        # ── (3) 미사일 경고 ────────────────────────────────────────────
+        missile_sim = ego_sim.check_missile_warning()
+        if missile_sim is not None:
+            missile_feature = np.concatenate(
+                (missile_sim.get_position(), missile_sim.get_velocity()))
+            ego_AO, ego_TA, R, side_flag = get_AO_TA_R(
+                ego_feature, missile_feature, return_side=True)
+            norm_obs[offset + 1] = (
+                np.linalg.norm(missile_sim.get_velocity()) - ego_state[9]) / 340
+            norm_obs[offset + 2] = (missile_feature[2] - ego_state[2]) / 1000
+            norm_obs[offset + 3] = ego_AO
+            norm_obs[offset + 4] = ego_TA
+            norm_obs[offset + 5] = R / 10000
+            norm_obs[offset + 6] = side_flag
+
+        return norm_obs
 
     def _rl_action_ego(self, uid: str) -> np.ndarray:
         """아군 RL 정책 행동 (정책 없으면 임시 오토파일럿)."""
@@ -471,7 +554,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                 return _discrete_to_normalized(act_cont)
             return np.array([20, 20, 20, 15], dtype=np.int32)
 
-        obs_arr = self._adapt_obs(self._get_paired_obs(uid)[np.newaxis, :], self.ego_policy)
+        obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
         obs_t = torch.from_numpy(obs_arr).float().to(self.device)
         mask_t = torch.ones((1, 1), dtype=torch.float32).to(self.device)
         rnn_t = torch.from_numpy(self._ego_rnn).to(self.device)
@@ -491,7 +574,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                 return _discrete_to_normalized(act_cont)
             return np.array([20, 20, 20, 15], dtype=np.int32)
 
-        obs_arr = self._adapt_obs(self._get_paired_obs(uid)[np.newaxis, :], self.enm_policy)
+        obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
         obs_t = torch.from_numpy(obs_arr).float().to(self.device)
         mask_t = torch.ones((1, 1), dtype=torch.float32).to(self.device)
         rnn_t = torch.from_numpy(self._enm_rnn).to(self.device)
