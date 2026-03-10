@@ -250,6 +250,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         # MultipleCombatEnv_LLM 추가 초기화
         self._build_partner_pairs()
         self._update_obs_space()
+        self._patch_task_get_obs()  # task.get_obs → 2-nearest-enemy 버전으로 교체
 
         # ── RL 정책 로드 ──────────────────────────────────────────────────
         self.ego_policy = self._load_policy(ego_policy_path)
@@ -449,6 +450,19 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
     # ------------------------------------------------------------------
     # 관측 공간 오버라이드 (파트너 1기 + 최근접 적 2기 + 미사일 슬롯)
     # ------------------------------------------------------------------
+
+    def _patch_task_get_obs(self):
+        """
+        task.get_obs(env, agent_id)를 2-nearest-enemy 버전으로 교체.
+        normalize_action 내부에서 task.get_obs가 호출되므로 반드시 패치 필요.
+        """
+        import types
+        env_ref = self
+
+        def patched_get_obs(task_self, env, agent_id):
+            return env_ref._get_paired_obs(agent_id)
+
+        self.task.get_obs = types.MethodType(patched_get_obs, self.task)
 
     def _update_obs_space(self):
         """obs_length = 9 + (1파트너 + NUM_NEAREST_ENEMIES + 1미사일) * 6 = 33 고정."""
