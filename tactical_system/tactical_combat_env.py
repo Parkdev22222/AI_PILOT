@@ -1,0 +1,808 @@
+"""
+tactical_combat_env.py
+======================
+MultipleCombatEnv_LLM 을 확장한 한반도 전술 전투 환경.
+
+주요 기능
+---------
+- 외부에서 전달받은 초기 위치로 JSBSim 시뮬레이터 초기화
+- 매 스텝 항공기 상태를 SQL DB 에 실시간 저장
+- 접근 단계 (>20 km): 자동 조종 (heading controller)
+- 교전 단계 (<20 km): RL 정책 (PPOActor / HierarchicalMultipleCombat)
+- 이벤트 감지 → bool 플래그 설정
+  * event_major_loss      : 아군 50% 이상 손실
+  * event_ammo_depleted   : 아군 기체 무장 고갈
+- RTB / 지원 편대 스폰 처리
+"""
+
+import logging
+import math
+import os
+import sys
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+# ── CloseAirCombat 경로 삽입 ─────────────────────────────────────────────────
+_CAC_ROOT = os.path.join(
+    os.path.dirname(__file__), "..", "external", "CloseAirCombat"
+)
+if _CAC_ROOT not in sys.path:
+    sys.path.insert(0, _CAC_ROOT)
+
+from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv_LLM
+from envs.JSBSim.core.simulatior import AircraftSimulator, MissileSimulator
+from envs.JSBSim.core.catalog import Catalog as c
+from algorithms.ppo.ppo_actor import PPOActor
+
+from .combat_db import CombatDB
+
+logger = logging.getLogger(__name__)
+
+APPROACH_DISTANCE_M = 20_000     # 접근 → 교전 전환 거리 (20 km)
+RELOAD_DISTANCE_M   = 2_000      # 기지 도착 판정 거리 (2 km)
+SUPPORT_SPAWN_ALT_M = 6_000      # 지원 편대 스폰 고도 (m)
+CRUISE_SPEED_FPS    = 800.0      # 순항 속도 (ft/s ≈ 244 m/s)
+CRUISE_ALT_M        = 6_000.0    # 순항 고도 (m)
+RELOAD_MISSILES     = 5          # 재장착 미사일 수
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 동적 config 생성 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_dynamic_config(
+    aircraft_configs: Dict,
+    battle_field_center: Tuple[float, float, float] = (127.5, 38.5, 0.0),
+    sim_freq: int = 60,
+    agent_interaction_steps: int = 12,
+    max_steps: int = 3000,
+):
+    """YAML parse 없이 동적으로 EnvConfig 오브젝트 생성."""
+    attrs = dict(
+        task="hierarchical_multiplecombat_shoot",
+        sim_freq=sim_freq,
+        agent_interaction_steps=agent_interaction_steps,
+        max_steps=max_steps,
+        altitude_limit=2500,
+        acceleration_limit_x=10.0,
+        acceleration_limit_y=10.0,
+        acceleration_limit_z=10.0,
+        battle_field_center=list(battle_field_center),
+        aircraft_configs=aircraft_configs,
+        max_attack_angle=45,
+        max_attack_distance=14000,
+        min_attack_interval=125,
+        PostureReward_scale=15.0,
+        PostureReward_potential=True,
+        PostureReward_orientation_version="v2",
+        PostureReward_range_version="v3",
+        AltitudeReward_safe_altitude=4.0,
+        AltitudeReward_danger_altitude=3.5,
+        AltitudeReward_Kv=0.2,
+    )
+    return type("EnvConfig", (), attrs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 오토파일럿 (접근 단계 heading controller)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bearing_rad(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """두 지점 간 방위각 (rad, 북=0, 시계방향)."""
+    d_lon = math.radians(lon2 - lon1)
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    x = math.sin(d_lon) * math.cos(lat2_r)
+    y = (math.cos(lat1_r) * math.sin(lat2_r)
+         - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(d_lon))
+    return math.atan2(x, y) % (2 * math.pi)
+
+
+def _haversine_m(lon1, lat1, lon2, lat2) -> float:
+    """두 지점 간 대원 거리 (m)."""
+    R = 6_371_000.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def compute_autopilot_action(
+    sim: AircraftSimulator,
+    target_lon: float,
+    target_lat: float,
+    target_alt_m: float = CRUISE_ALT_M,
+) -> np.ndarray:
+    """
+    목표 지점 방향으로 기동하는 저수준 제어 액션 계산.
+
+    Returns
+    -------
+    np.ndarray shape (4,) : [aileron, elevator, rudder, throttle]  정규화 완료
+    """
+    lon, lat, alt = sim.get_geodetic()
+    roll, pitch, heading = sim.get_rpy()   # rad
+    v_north, v_east, v_down = sim.get_velocity()
+
+    desired_heading = _bearing_rad(lon, lat, target_lon, target_lat)
+
+    # 헤딩 오차 (−π … π)
+    hdg_err = desired_heading - heading
+    while hdg_err > math.pi:
+        hdg_err -= 2 * math.pi
+    while hdg_err < -math.pi:
+        hdg_err += 2 * math.pi
+
+    # 고도 오차
+    alt_err = target_alt_m - alt
+
+    # ─── PD 제어기 ───
+    # aileron: 뱅크-투-턴
+    aileron = float(np.clip(1.2 * hdg_err, -1.0, 1.0))
+    # elevator: 고도 보정 + 피치 댐핑
+    elevator = float(np.clip(-0.0003 * alt_err - 1.5 * pitch, -1.0, 1.0))
+    rudder = 0.0
+    throttle = 0.85
+
+    # action_var 의 정규화된 값 직접 반환 (HierarchicalTask 의 baseline lowlevel 우회)
+    return np.array([aileron, elevator, rudder, throttle], dtype=np.float32)
+
+
+def _discrete_to_normalized(action_continuous: np.ndarray) -> np.ndarray:
+    """
+    연속 제어값 [-1..1, -1..1, -1..1, 0..1] →
+    MultiDiscrete [41, 41, 41, 30] 인덱스로 변환.
+    (MultipleCombatTask.normalize_action 역변환)
+    """
+    nvec = np.array([41, 41, 41, 30])
+    disc = np.zeros(4, dtype=np.int32)
+    disc[0] = int(round((action_continuous[0] + 1.0) * (nvec[0] - 1) / 2.0))
+    disc[1] = int(round((action_continuous[1] + 1.0) * (nvec[1] - 1) / 2.0))
+    disc[2] = int(round((action_continuous[2] + 1.0) * (nvec[2] - 1) / 2.0))
+    disc[3] = int(round((action_continuous[3] - 0.4) * (nvec[3] - 1) / 0.5))
+    return np.clip(disc, 0, nvec - 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 전술 전투 환경
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TacticalCombatEnv(MultipleCombatEnv_LLM):
+    """
+    한반도 전술 전투 환경.
+
+    Parameters
+    ----------
+    formation_pairs : list of dict
+        [{"friendly_uids": ["A0100","A0200"],
+          "enemy_uids":    ["B0100","B0200"],
+          "friendly_base": {"name":…,"lon":…,"lat":…},
+          "enemy_base":    {"name":…,"lon":…,"lat":…},
+          "friendly_init_states": {uid: init_state_dict, …},
+          "enemy_init_states":    {uid: init_state_dict, …}}, …]
+    db : CombatDB
+    sim_id : int
+    ego_policy_path : str   PPOActor 체크포인트 경로
+    enm_policy_path : str
+    battle_field_center : (lon, lat, alt)
+    """
+
+    def __init__(
+        self,
+        formation_pairs: List[Dict],
+        db: CombatDB,
+        sim_id: int,
+        ego_policy_path: str,
+        enm_policy_path: str,
+        battle_field_center: Tuple[float, float, float] = (127.5, 38.5, 0.0),
+        device: str = "cpu",
+    ):
+        self.formation_pairs = formation_pairs
+        self.db = db
+        self.sim_id = sim_id
+        self.device = torch.device(device)
+
+        # ── 항공기 configs 동적 생성 ──────────────────────────────────────
+        aircraft_configs = {}
+        for pair in formation_pairs:
+            for uid, state in pair["friendly_init_states"].items():
+                aircraft_configs[uid] = {
+                    "color": "Blue",
+                    "model": "f16",
+                    "init_state": state,
+                    "missile": 2,
+                }
+            for uid, state in pair["enemy_init_states"].items():
+                aircraft_configs[uid] = {
+                    "color": "Red",
+                    "model": "f16",
+                    "init_state": state,
+                    "missile": 2,
+                }
+
+        config = make_dynamic_config(
+            aircraft_configs=aircraft_configs,
+            battle_field_center=battle_field_center,
+        )
+
+        # ── BaseEnv.__init__ 우회: config 직접 주입 ───────────────────────
+        self.config = config
+        self.max_steps = config.max_steps
+        self.sim_freq = config.sim_freq
+        self.agent_interaction_steps = config.agent_interaction_steps
+        clon, clat, calt = battle_field_center
+        self.center_lon = clon
+        self.center_lat = clat
+        self.center_alt = calt
+        self._create_records = False
+
+        self.load()  # load_task() + load_simulator()
+
+        # MultipleCombatEnv_LLM 추가 초기화
+        self._build_partner_pairs()
+        self._update_obs_space()
+
+        # ── RL 정책 로드 ──────────────────────────────────────────────────
+        self.ego_policy = self._load_policy(ego_policy_path)
+        self.enm_policy = self._load_policy(enm_policy_path)
+
+        # ── 단계 관리 ─────────────────────────────────────────────────────
+        # pair_idx → 'approach' | 'combat' | 'rtb_loss' | 'rtb_ammo' | 'support' | 'done'
+        self.pair_phases: Dict[int, str] = {
+            i: "approach" for i in range(len(formation_pairs))
+        }
+
+        # 재장착 대기 기체: {uid: {"home_lon":…,"home_lat":…,"combat_lon":…,"combat_lat":…}}
+        self.reload_pending: Dict[str, Dict] = {}
+        # 복귀 완료 후 재출격 대기: {uid: {"combat_lon":…,"combat_lat":…,"missiles":5}}
+        self.reloaded_returning: Dict[str, Dict] = {}
+
+        # ── 이벤트 플래그 ─────────────────────────────────────────────────
+        self.event_major_loss: bool = False
+        self.event_major_loss_id: Optional[int] = None
+        self.event_ammo_depleted: bool = False
+        self.event_ammo_depleted_ids: Dict[str, int] = {}  # uid → event_id
+
+        # RL RNN 상태
+        n_agents = len(self.ego_ids)
+        self._ego_rnn = np.zeros((1, 1, 128), dtype=np.float32)
+        self._enm_rnn = np.zeros((1, 1, 128), dtype=np.float32)
+        self._masks = np.ones((max(n_agents, 1), 1), dtype=np.float32)
+
+        # 편대 → DB formation_id 매핑
+        self._friendly_formation_ids: Dict[int, int] = {}
+        self._enemy_formation_ids: Dict[int, int] = {}
+
+        # 지원 편대 스폰 추적
+        self._support_spawned: Dict[int, bool] = {i: False for i in range(len(formation_pairs))}
+
+    # ------------------------------------------------------------------
+    # 정책 로드
+    # ------------------------------------------------------------------
+
+    def _load_policy(self, path: str) -> Optional[PPOActor]:
+        if not path or not os.path.exists(path):
+            logger.warning(f"정책 파일 없음: {path}. 오토파일럿으로 대체.")
+            return None
+
+        class _Args:
+            gain = 0.01
+            hidden_size = "128 128"
+            act_hidden_size = "128 128"
+            activation_id = 1
+            use_feature_normalization = False
+            use_recurrent_policy = True
+            recurrent_hidden_size = 128
+            recurrent_hidden_layers = 1
+            tpdv = dict(dtype=torch.float32, device=torch.device("cpu"))
+            use_prior = True
+
+        policy = PPOActor(_Args(), self.observation_space, self.action_space,
+                          device=self.device)
+        policy.load_state_dict(torch.load(path, map_location=self.device))
+        policy.eval()
+        return policy
+
+    # ------------------------------------------------------------------
+    # 재설정
+    # ------------------------------------------------------------------
+
+    def reset(self):
+        obs, share_obs = super().reset()
+        # 이벤트 플래그 초기화
+        self.event_major_loss = False
+        self.event_major_loss_id = None
+        self.event_ammo_depleted = False
+        self.event_ammo_depleted_ids.clear()
+        self.reload_pending.clear()
+        self.reloaded_returning.clear()
+        self.pair_phases = {i: "approach" for i in range(len(self.formation_pairs))}
+        self._support_spawned = {i: False for i in range(len(self.formation_pairs))}
+        n_agents = len(self.ego_ids)
+        self._ego_rnn = np.zeros((1, 1, 128), dtype=np.float32)
+        self._enm_rnn = np.zeros((1, 1, 128), dtype=np.float32)
+        self._masks = np.ones((max(n_agents, 1), 1), dtype=np.float32)
+        return obs, share_obs
+
+    # ------------------------------------------------------------------
+    # 메인 스텝 (접근 + 교전 + 이벤트 처리 통합)
+    # ------------------------------------------------------------------
+
+    def step_tactical(self) -> Dict:
+        """
+        전술 전투 환경의 단일 스텝.
+        접근 단계: 오토파일럿 / 교전 단계: RL 정책.
+
+        Returns
+        -------
+        info dict (dones, rewards, events, …)
+        """
+        # ── 행동 계산 ──────────────────────────────────────────────────
+        actions = self._compute_actions()
+
+        # ── 환경 스텝 ──────────────────────────────────────────────────
+        obs, share_obs, rewards, dones, info = self.step(actions)
+
+        # ── 재장착 기체 처리 ────────────────────────────────────────────
+        self._process_reload_aircraft()
+
+        # ── DB 저장 ────────────────────────────────────────────────────
+        self._save_states_to_db()
+
+        # ── 단계 전환 확인 ──────────────────────────────────────────────
+        self._update_pair_phases()
+
+        # ── 이벤트 감지 ────────────────────────────────────────────────
+        self._detect_events()
+
+        info["pair_phases"] = dict(self.pair_phases)
+        info["event_major_loss"] = self.event_major_loss
+        info["event_major_loss_id"] = self.event_major_loss_id
+        info["event_ammo_depleted"] = self.event_ammo_depleted
+        info["event_ammo_depleted_ids"] = dict(self.event_ammo_depleted_ids)
+
+        return obs, share_obs, rewards, dones, info
+
+    # ------------------------------------------------------------------
+    # 행동 계산
+    # ------------------------------------------------------------------
+
+    def _compute_actions(self) -> np.ndarray:
+        """
+        각 항공기의 단계에 따라 오토파일럿 또는 RL 정책 행동 반환.
+        shape: (num_agents, action_dim)
+        """
+        all_actions = {}
+
+        # 아군
+        for i, pair in enumerate(self.formation_pairs):
+            phase = self.pair_phases[i]
+            friendly_uids = [u for u in pair["friendly_uids"] if u in self.agents]
+            enemy_uids    = [u for u in pair["enemy_uids"]    if u in self.agents]
+
+            for uid in friendly_uids:
+                sim = self.agents[uid]
+                if not sim.is_alive:
+                    all_actions[uid] = np.array([20, 20, 20, 15], dtype=np.int32)
+                    continue
+
+                if uid in self.reload_pending:
+                    # 기지로 귀환 중
+                    home = self.reload_pending[uid]
+                    act_cont = compute_autopilot_action(
+                        sim, home["home_lon"], home["home_lat"])
+                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                elif uid in self.reloaded_returning:
+                    # 재장착 완료, 교전 지역 복귀 중
+                    ret = self.reloaded_returning[uid]
+                    act_cont = compute_autopilot_action(
+                        sim, ret["combat_lon"], ret["combat_lat"])
+                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                elif phase == "approach":
+                    # 적 편대 중심으로 접근
+                    tgt_lon, tgt_lat = self._formation_centroid(enemy_uids)
+                    act_cont = compute_autopilot_action(sim, tgt_lon, tgt_lat)
+                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                elif phase in ("rtb_loss",):
+                    # 기지 복귀
+                    base = pair["friendly_base"]
+                    act_cont = compute_autopilot_action(
+                        sim, base["lon"], base["lat"], target_alt_m=5000.0)
+                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                elif phase == "support":
+                    # 지원 요청 → 기존 잔존 기체는 계속 전투 (RL)
+                    all_actions[uid] = self._rl_action_ego(uid)
+                else:
+                    # combat 단계: RL
+                    all_actions[uid] = self._rl_action_ego(uid)
+
+        # 적군 (항상 오토파일럿 접근 or RL 교전)
+        for i, pair in enumerate(self.formation_pairs):
+            phase = self.pair_phases[i]
+            friendly_uids = [u for u in pair["friendly_uids"] if u in self.agents]
+            enemy_uids    = [u for u in pair["enemy_uids"]    if u in self.agents]
+
+            for uid in enemy_uids:
+                sim = self.agents[uid]
+                if not sim.is_alive:
+                    all_actions[uid] = np.array([20, 20, 20, 15], dtype=np.int32)
+                    continue
+                if phase == "approach":
+                    tgt_lon, tgt_lat = self._formation_centroid(friendly_uids)
+                    act_cont = compute_autopilot_action(sim, tgt_lon, tgt_lat)
+                    all_actions[uid] = _discrete_to_normalized(act_cont)
+                else:
+                    all_actions[uid] = self._rl_action_enm(uid)
+
+        # _pack 순서에 맞춰 배열 구성
+        ordered = [all_actions[uid] for uid in self.ego_ids + self.enm_ids]
+        return np.array(ordered, dtype=np.int32)
+
+    def _rl_action_ego(self, uid: str) -> np.ndarray:
+        """아군 RL 정책 행동 (정책 없으면 임시 오토파일럿)."""
+        if self.ego_policy is None:
+            sim = self.agents[uid]
+            enm_alive = [e for e in sim.enemies if e.is_alive]
+            if enm_alive:
+                lon, lat, _ = enm_alive[0].get_geodetic()
+                act_cont = compute_autopilot_action(sim, lon, lat)
+                return _discrete_to_normalized(act_cont)
+            return np.array([20, 20, 20, 15], dtype=np.int32)
+
+        obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
+        obs_t = torch.from_numpy(obs_arr).float().to(self.device)
+        mask_t = torch.ones((1, 1), dtype=torch.float32).to(self.device)
+        rnn_t = torch.from_numpy(self._ego_rnn).to(self.device)
+        with torch.no_grad():
+            action_t, _, rnn_t = self.ego_policy(obs_t, rnn_t, mask_t, deterministic=True)
+        self._ego_rnn = rnn_t.cpu().numpy()
+        return action_t.cpu().numpy().squeeze(0).astype(np.int32)
+
+    def _rl_action_enm(self, uid: str) -> np.ndarray:
+        """적군 RL 정책 행동."""
+        if self.enm_policy is None:
+            sim = self.agents[uid]
+            enm_alive = [e for e in sim.enemies if e.is_alive]
+            if enm_alive:
+                lon, lat, _ = enm_alive[0].get_geodetic()
+                act_cont = compute_autopilot_action(sim, lon, lat)
+                return _discrete_to_normalized(act_cont)
+            return np.array([20, 20, 20, 15], dtype=np.int32)
+
+        obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
+        obs_t = torch.from_numpy(obs_arr).float().to(self.device)
+        mask_t = torch.ones((1, 1), dtype=torch.float32).to(self.device)
+        rnn_t = torch.from_numpy(self._enm_rnn).to(self.device)
+        with torch.no_grad():
+            action_t, _, rnn_t = self.enm_policy(obs_t, rnn_t, mask_t, deterministic=True)
+        self._enm_rnn = rnn_t.cpu().numpy()
+        return action_t.cpu().numpy().squeeze(0).astype(np.int32)
+
+    # ------------------------------------------------------------------
+    # 편대 중심 계산
+    # ------------------------------------------------------------------
+
+    def _formation_centroid(self, uids: List[str]) -> Tuple[float, float]:
+        """살아있는 기체들의 위도/경도 평균."""
+        alive = [u for u in uids if u in self.agents and self.agents[u].is_alive]
+        if not alive:
+            uids_use = uids
+        else:
+            uids_use = alive
+        lons, lats = [], []
+        for u in uids_use:
+            if u in self.agents:
+                lon, lat, _ = self.agents[u].get_geodetic()
+                lons.append(lon)
+                lats.append(lat)
+        if not lons:
+            return self.center_lon, self.center_lat
+        return float(np.mean(lons)), float(np.mean(lats))
+
+    # ------------------------------------------------------------------
+    # 페어 거리 및 단계 전환
+    # ------------------------------------------------------------------
+
+    def _pair_min_distance_m(self, friendly_uids: List[str], enemy_uids: List[str]) -> float:
+        """편대 쌍 최소 기체간 거리 (m)."""
+        min_d = float("inf")
+        for fu in friendly_uids:
+            if fu not in self.agents or not self.agents[fu].is_alive:
+                continue
+            flon, flat, _ = self.agents[fu].get_geodetic()
+            for eu in enemy_uids:
+                if eu not in self.agents or not self.agents[eu].is_alive:
+                    continue
+                elon, elat, _ = self.agents[eu].get_geodetic()
+                d = _haversine_m(flon, flat, elon, elat)
+                min_d = min(min_d, d)
+        return min_d
+
+    def _update_pair_phases(self):
+        for i, pair in enumerate(self.formation_pairs):
+            if self.pair_phases[i] in ("done", "rtb_loss"):
+                continue
+            friendly_uids = pair["friendly_uids"]
+            enemy_uids    = pair["enemy_uids"]
+            if self.pair_phases[i] == "approach":
+                dist = self._pair_min_distance_m(friendly_uids, enemy_uids)
+                if dist <= APPROACH_DISTANCE_M:
+                    logger.info(f"편대쌍 {i}: 접근 완료 ({dist/1000:.1f}km) → 교전 시작")
+                    self.pair_phases[i] = "combat"
+
+    # ------------------------------------------------------------------
+    # 이벤트 감지
+    # ------------------------------------------------------------------
+
+    def _detect_events(self):
+        step = self.current_step
+        ts = step * self.time_interval
+
+        # ── 50% 이상 손실 ──────────────────────────────────────────────
+        if not self.event_major_loss:
+            total_friendly = len(self.ego_ids)
+            alive_friendly = sum(
+                1 for uid in self.ego_ids
+                if self.agents[uid].is_alive
+            )
+            if total_friendly > 0 and alive_friendly < total_friendly * 0.5:
+                dead_list = [
+                    uid for uid in self.ego_ids
+                    if not self.agents[uid].is_alive
+                ]
+                details = {
+                    "total_friendly": total_friendly,
+                    "alive_friendly": alive_friendly,
+                    "dead_aircraft": dead_list,
+                    "loss_ratio": 1.0 - alive_friendly / total_friendly,
+                }
+                event_id = self.db.log_event(
+                    self.sim_id, step, ts, "major_loss", details
+                )
+                self.event_major_loss = True
+                self.event_major_loss_id = event_id
+                logger.warning(
+                    f"[이벤트] 아군 전력 50% 이상 손실 (event_id={event_id})"
+                )
+
+        # ── 무장 고갈 ──────────────────────────────────────────────────
+        for uid in self.ego_ids:
+            if uid in self.event_ammo_depleted_ids:
+                continue
+            sim = self.agents[uid]
+            if not sim.is_alive:
+                continue
+            if uid in self.reload_pending or uid in self.reloaded_returning:
+                continue
+            if sim.num_left_missiles == 0:
+                details = {
+                    "aircraft_uid": uid,
+                    "missiles_left": 0,
+                    "step": step,
+                }
+                event_id = self.db.log_event(
+                    self.sim_id, step, ts, "ammo_depleted", details
+                )
+                self.event_ammo_depleted_ids[uid] = event_id
+                self.event_ammo_depleted = True
+                logger.warning(
+                    f"[이벤트] {uid} 무장 고갈 (event_id={event_id})"
+                )
+
+    # ------------------------------------------------------------------
+    # 이벤트 처리 (컨트롤러에서 LLM 결정 후 호출)
+    # ------------------------------------------------------------------
+
+    def handle_major_loss_rtb(self):
+        """아군 전체 RTB: 잔존 기체 기지 방향으로 전환."""
+        logger.info("[처리] 아군 전체 RTB 명령")
+        for i in range(len(self.formation_pairs)):
+            if self.pair_phases[i] not in ("done",):
+                self.pair_phases[i] = "rtb_loss"
+
+    def handle_request_support(self, support_base: Dict, pair_idx: int):
+        """
+        지원 편대 스폰.
+
+        Parameters
+        ----------
+        support_base : {"name":…, "lon":…, "lat":…}
+        pair_idx     : 교전 중인 편대쌍 인덱스
+        """
+        if self._support_spawned.get(pair_idx, False):
+            return
+        pair = self.formation_pairs[pair_idx]
+        combat_lon, combat_lat = self._formation_centroid(pair["enemy_uids"])
+
+        # 새 UID (S=support 접두어)
+        uid_a = f"S{pair_idx}100"
+        uid_b = f"S{pair_idx}200"
+
+        lon0, lat0, alt0 = (
+            support_base["lon"],
+            support_base["lat"],
+            SUPPORT_SPAWN_ALT_M,
+        )
+        # JSBSim 초기 상태: 기지 위치에서 출발
+        init_common = {
+            "ic_long_gc_deg": lon0,
+            "ic_lat_geod_deg": lat0,
+            "ic_h_sl_ft": SUPPORT_SPAWN_ALT_M * 3.28084,
+            "ic_psi_true_deg": float(_bearing_rad(lon0, lat0, combat_lon, combat_lat) * 180 / math.pi),
+            "ic_u_fps": CRUISE_SPEED_FPS,
+        }
+
+        for uid in [uid_a, uid_b]:
+            sim = AircraftSimulator(
+                uid=uid,
+                color="Blue",
+                model="f16",
+                init_state=init_common,
+                origin=(self.center_lon, self.center_lat, self.center_alt),
+                sim_freq=self.sim_freq,
+                num_missiles=2,
+            )
+            # 적군을 enemies 로 연결
+            for eu in pair["enemy_uids"]:
+                if eu in self.agents and self.agents[eu].is_alive:
+                    sim.enemies.append(self.agents[eu])
+                    self.agents[eu].enemies.append(sim)
+            self.add_temp_simulator(sim)
+
+        self._support_spawned[pair_idx] = True
+        self.pair_phases[pair_idx] = "support"
+        logger.info(
+            f"[처리] 지원 편대 스폰: {uid_a}, {uid_b} (기지: {support_base['name']})"
+        )
+
+    def handle_ammo_rtb(self, uid: str):
+        """
+        무장 고갈 기체 RTB → 기지 귀환 후 AIM-9L 5발 재장착 → 복귀 시작.
+        """
+        pair_idx = self._find_pair_for_uid(uid)
+        if pair_idx is None:
+            return
+        pair = self.formation_pairs[pair_idx]
+        home = pair["friendly_base"]
+        enm_lon, enm_lat = self._formation_centroid(pair["enemy_uids"])
+
+        self.reload_pending[uid] = {
+            "home_lon": home["lon"],
+            "home_lat": home["lat"],
+            "combat_lon": enm_lon,
+            "combat_lat": enm_lat,
+        }
+        logger.info(f"[처리] {uid} 재장착 RTB 시작 → {home['name']}")
+
+    def _process_reload_aircraft(self):
+        """
+        reload_pending 기체가 기지에 도착하면 재장착 후 복귀 큐로 이동.
+        reloaded_returning 기체가 교전 지역에 도착하면 대기 해제.
+        """
+        completed_reload = []
+        for uid, info in self.reload_pending.items():
+            if uid not in self.agents or not self.agents[uid].is_alive:
+                completed_reload.append(uid)
+                continue
+            sim = self.agents[uid]
+            lon, lat, _ = sim.get_geodetic()
+            dist = _haversine_m(lon, lat, info["home_lon"], info["home_lat"])
+            if dist <= RELOAD_DISTANCE_M:
+                # 재장착
+                sim.num_left_missiles = RELOAD_MISSILES
+                sim.num_missiles = RELOAD_MISSILES
+                self.reloaded_returning[uid] = {
+                    "combat_lon": info["combat_lon"],
+                    "combat_lat": info["combat_lat"],
+                    "missiles": RELOAD_MISSILES,
+                }
+                completed_reload.append(uid)
+                logger.info(f"[처리] {uid} 재장착 완료. 교전 지역 복귀 시작.")
+
+        for uid in completed_reload:
+            self.reload_pending.pop(uid, None)
+
+        completed_return = []
+        for uid, info in self.reloaded_returning.items():
+            if uid not in self.agents or not self.agents[uid].is_alive:
+                completed_return.append(uid)
+                continue
+            sim = self.agents[uid]
+            lon, lat, _ = sim.get_geodetic()
+            dist = _haversine_m(lon, lat, info["combat_lon"], info["combat_lat"])
+            if dist <= APPROACH_DISTANCE_M:
+                completed_return.append(uid)
+                logger.info(f"[처리] {uid} 교전 지역 도착. 전투 재개.")
+        for uid in completed_return:
+            self.reloaded_returning.pop(uid, None)
+
+    # ------------------------------------------------------------------
+    # DB 저장
+    # ------------------------------------------------------------------
+
+    def _save_states_to_db(self):
+        step = self.current_step
+        ts = step * self.time_interval
+
+        for i, pair in enumerate(self.formation_pairs):
+            fid = self._friendly_formation_ids.get(i, i)
+            eid = self._enemy_formation_ids.get(i, i)
+
+            for uid in pair["friendly_uids"]:
+                if uid not in self.agents:
+                    continue
+                self._save_one_aircraft(
+                    uid=uid, team="friendly",
+                    formation_id=fid,
+                    base_name=pair["friendly_base"]["name"],
+                    step=step, ts=ts,
+                    phase=self._get_uid_phase(uid, i),
+                )
+
+            for uid in pair["enemy_uids"]:
+                if uid not in self.agents:
+                    continue
+                self._save_one_aircraft(
+                    uid=uid, team="enemy",
+                    formation_id=eid,
+                    base_name=pair["enemy_base"]["name"],
+                    step=step, ts=ts,
+                    phase=self.pair_phases[i],
+                )
+
+    def _save_one_aircraft(
+        self, uid, team, formation_id, base_name, step, ts, phase
+    ):
+        sim = self.agents[uid]
+        lon, lat, alt = sim.get_geodetic()
+        _, _, heading_rad = sim.get_rpy()
+        heading_deg = math.degrees(heading_rad) % 360
+        vn, ve, vd = sim.get_velocity()
+        speed = float(np.linalg.norm([vn, ve, vd]))
+        missiles = getattr(sim, "num_left_missiles", 0)
+
+        self.db.save_aircraft_state(
+            sim_id=self.sim_id,
+            step=step,
+            timestamp=ts,
+            aircraft_uid=uid,
+            team=team,
+            formation_id=formation_id,
+            base_name=base_name,
+            is_alive=sim.is_alive,
+            lon=lon, lat=lat, alt=alt,
+            heading_deg=heading_deg,
+            speed_mps=speed,
+            health=float(sim.bloods),
+            missiles_left=missiles,
+            flight_phase=phase,
+        )
+
+    def _get_uid_phase(self, uid: str, pair_idx: int) -> str:
+        if uid in self.reload_pending:
+            return "reload"
+        if uid in self.reloaded_returning:
+            return "returning"
+        return self.pair_phases[pair_idx]
+
+    def _find_pair_for_uid(self, uid: str) -> Optional[int]:
+        for i, pair in enumerate(self.formation_pairs):
+            if uid in pair["friendly_uids"]:
+                return i
+        return None
+
+    # ------------------------------------------------------------------
+    # DB formation_id 등록 (컨트롤러에서 호출)
+    # ------------------------------------------------------------------
+
+    def register_formation_ids(
+        self,
+        friendly_ids: Dict[int, int],
+        enemy_ids: Dict[int, int],
+    ):
+        self._friendly_formation_ids = friendly_ids
+        self._enemy_formation_ids = enemy_ids
