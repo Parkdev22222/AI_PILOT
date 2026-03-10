@@ -143,7 +143,7 @@ class TacticalDashboard:
             conn = sqlite3.connect(self.db.db_path)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT * FROM events WHERE sim_id=? ORDER BY step DESC LIMIT 100",
+                "SELECT * FROM events WHERE sim_id=? ORDER BY step ASC LIMIT 100",
                 (self.sim_id,),
             ).fetchall()
             conn.close()
@@ -344,7 +344,12 @@ class TacticalDashboard:
                 xanchor="left", yanchor="top",
             ),
             height=650,
-            uirevision="map",   # 갱신 시 뷰포트 유지
+            uirevision="map",       # 갱신 시 뷰포트(줌/패닝) 유지
+            transition=dict(        # 트레이스 데이터 변경 시 부드럽게 전환
+                duration=400,
+                easing="cubic-in-out",
+                ordering="traces first",
+            ),
         )
         return fig
 
@@ -521,10 +526,81 @@ class TacticalDashboard:
     def _make_event_html(self) -> str:
         events = self._events()
 
-        header = """
+        rows_html = ""
+        if not events:
+            rows_html = "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>"
+        else:
+            for e in events:
+                etype   = _EVENT_TYPE_KO.get(e.get("event_type", ""), e.get("event_type", "-"))
+                details = e.get("details_json", {})
+                dec     = e.get("llm_decision") or {}
+
+                if isinstance(details, dict):
+                    if "loss_ratio" in details:
+                        detail_str = (
+                            f"생존 {details.get('alive_friendly','?')}/"
+                            f"{details.get('total_friendly','?')}대 "
+                            f"({details['loss_ratio']*100:.0f}% 손실)"
+                        )
+                    elif "aircraft_uid" in details:
+                        detail_str = f"{details['aircraft_uid']} 무장 고갈"
+                    else:
+                        detail_str = str(details)[:60]
+                else:
+                    detail_str = str(details)[:60]
+
+                action_ko = {
+                    "rtb":             "전체 RTB",
+                    "request_support": "지원 요청",
+                    "continue":        "임무 지속",
+                }.get(dec.get("action", ""), dec.get("action", "-") if dec else "-")
+
+                resolved_badge = (
+                    "<span class='badge-ok'>완료</span>"
+                    if e.get("resolved")
+                    else "<span class='badge-wait'>대기</span>"
+                )
+                type_class = "event-loss" if "손실" in etype else "event-ammo"
+
+                rows_html += (
+                    f"<tr>"
+                    f"<td>{e.get('step','-')}</td>"
+                    f"<td class='{type_class}'>{etype}</td>"
+                    f"<td>{detail_str}</td>"
+                    f"<td>{action_ko}</td>"
+                    f"<td>{resolved_badge}</td>"
+                    f"</tr>\n"
+                )
+
+        # sessionStorage 기반 스크롤 위치 보존 + 맨 아래일 때 자동 스크롤
+        scroll_js = """
+<script>
+(function(){
+  var el = document.getElementById('ev-scroll');
+  if (!el) return;
+  var saved   = sessionStorage.getItem('evScroll');
+  var atBot   = sessionStorage.getItem('evAtBottom') !== '0';
+  function restore() {
+    if (atBot) {
+      el.scrollTop = el.scrollHeight;
+    } else if (saved !== null) {
+      el.scrollTop = parseInt(saved, 10);
+    }
+    el.addEventListener('scroll', function() {
+      sessionStorage.setItem('evScroll', el.scrollTop);
+      var isBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      sessionStorage.setItem('evAtBottom', isBot ? '1' : '0');
+    }, {passive: true});
+  }
+  if (el.scrollHeight > 0) { restore(); }
+  else { requestAnimationFrame(restore); }
+})();
+</script>"""
+
+        return f"""
 <div class='event-wrapper'>
   <div class='event-header'>🚨 이벤트 로그</div>
-  <div class='event-scroll'>
+  <div class='event-scroll' id='ev-scroll'>
     <table class='event-tbl'>
       <thead>
         <tr>
@@ -533,56 +609,12 @@ class TacticalDashboard:
         </tr>
       </thead>
       <tbody>
-"""
-        footer = "      </tbody>\n    </table>\n  </div>\n</div>"
-
-        if not events:
-            return header + "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>" + footer
-
-        rows_html = ""
-        for e in events:
-            etype   = _EVENT_TYPE_KO.get(e.get("event_type", ""), e.get("event_type", "-"))
-            details = e.get("details_json", {})
-            dec     = e.get("llm_decision") or {}
-
-            if isinstance(details, dict):
-                if "loss_ratio" in details:
-                    detail_str = (
-                        f"생존 {details.get('alive_friendly','?')}/"
-                        f"{details.get('total_friendly','?')}대 "
-                        f"({details['loss_ratio']*100:.0f}% 손실)"
-                    )
-                elif "aircraft_uid" in details:
-                    detail_str = f"{details['aircraft_uid']} 무장 고갈"
-                else:
-                    detail_str = str(details)[:60]
-            else:
-                detail_str = str(details)[:60]
-
-            action_ko = {
-                "rtb":             "전체 RTB",
-                "request_support": "지원 요청",
-                "continue":        "임무 지속",
-            }.get(dec.get("action", ""), dec.get("action", "-") if dec else "-")
-
-            resolved_badge = (
-                "<span class='badge-ok'>완료</span>"
-                if e.get("resolved")
-                else "<span class='badge-wait'>대기</span>"
-            )
-            type_class = "event-loss" if "손실" in etype else "event-ammo"
-
-            rows_html += (
-                f"<tr>"
-                f"<td>{e.get('step','-')}</td>"
-                f"<td class='{type_class}'>{etype}</td>"
-                f"<td>{detail_str}</td>"
-                f"<td>{action_ko}</td>"
-                f"<td>{resolved_badge}</td>"
-                f"</tr>\n"
-            )
-
-        return header + rows_html + footer
+{rows_html}
+      </tbody>
+    </table>
+  </div>
+</div>
+{scroll_js}"""
 
     # ------------------------------------------------------------------
     # 통합 갱신 콜백
@@ -604,6 +636,13 @@ class TacticalDashboard:
         /* ── 전체 배경 ── */
         body, .gradio-container { background:#1e1e2e !important; color:#cdd6f4; }
         footer { display:none !important; }
+
+        /* ── 갱신 중 깜빡임 억제 ── */
+        .generating, .generating * { opacity: 1 !important; }
+        .wrap.generating > div     { opacity: 1 !important; transition: none !important; }
+        .gr-plot > div, .svelte-1gfkn6j { transition: opacity 0.25s ease !important; }
+        /* HTML 컴포넌트 교체 시 부드러운 페이드 */
+        .gr-html { transition: opacity 0.2s ease; }
 
         /* ── 헤더 ── */
         .header-md h1 { color:#89b4fa; margin-bottom:2px; }
@@ -658,6 +697,14 @@ class TacticalDashboard:
         }
         """
 
+        # 초기화 JS: sessionStorage 기본값 설정 (첫 로드 시 맨 아래 자동 스크롤 허용)
+        init_js = """
+() => {
+  if (sessionStorage.getItem('evAtBottom') === null) {
+    sessionStorage.setItem('evAtBottom', '1');
+  }
+}
+"""
         with gr.Blocks(
             title="한반도 전술 공중전 시뮬레이터",
             theme=gr.themes.Base(
@@ -665,6 +712,7 @@ class TacticalDashboard:
                 neutral_hue=gr.themes.colors.slate,
             ),
             css=css,
+            js=init_js,
         ) as demo:
 
             # ── 헤더 ──────────────────────────────────────────────────
