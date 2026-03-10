@@ -34,7 +34,7 @@ if _CAC_ROOT not in sys.path:
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv_LLM
 from envs.JSBSim.core.simulatior import AircraftSimulator, MissileSimulator
 from envs.JSBSim.core.catalog import Catalog as c
-from algorithms.ppo.ppo_actor import PPOActor
+from algorithms.mappo.ppo_actor import PPOActor
 
 from .combat_db import CombatDB
 
@@ -299,11 +299,17 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             recurrent_hidden_size = 128
             recurrent_hidden_layers = 1
             tpdv = dict(dtype=torch.float32, device=torch.device("cpu"))
-            use_prior = True
 
-        policy = PPOActor(_Args(), self.observation_space, self.action_space,
+        # 체크포인트에서 실제 obs_dim 추출하여 모델 구조 맞춤
+        ckpt = torch.load(path, map_location=self.device)
+        ckpt_obs_dim = ckpt["base.mlp.fc.0.weight"].shape[1]
+        from gymnasium import spaces as gym_spaces
+        obs_space = gym_spaces.Box(low=-10, high=10., shape=(ckpt_obs_dim,))
+
+        policy = PPOActor(_Args(), obs_space, self.action_space,
                           device=self.device)
-        policy.load_state_dict(torch.load(path, map_location=self.device))
+        policy.load_state_dict(ckpt)
+        policy._ckpt_obs_dim = ckpt_obs_dim  # 추론 시 obs 자르기에 사용
         policy.eval()
         return policy
 
@@ -442,6 +448,18 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         ordered = [all_actions[uid] for uid in self.ego_ids + self.enm_ids]
         return np.array(ordered, dtype=np.int32)
 
+    def _adapt_obs(self, obs: np.ndarray, policy) -> np.ndarray:
+        """
+        env obs(39dim)를 체크포인트 obs_dim에 맞게 조정.
+        LLM env는 [0:9] ego + [9:15] partner + [15:] enemies 구조이므로
+        partner 슬롯을 제거하면 원래 학습 obs와 일치함.
+        """
+        ckpt_dim = getattr(policy, "_ckpt_obs_dim", obs.shape[-1])
+        if obs.shape[-1] == ckpt_dim:
+            return obs
+        # partner 슬롯([..., 9:15]) 제거
+        return np.concatenate([obs[..., :9], obs[..., 15:]], axis=-1)[..., :ckpt_dim]
+
     def _rl_action_ego(self, uid: str) -> np.ndarray:
         """아군 RL 정책 행동 (정책 없으면 임시 오토파일럿)."""
         if self.ego_policy is None:
@@ -453,7 +471,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                 return _discrete_to_normalized(act_cont)
             return np.array([20, 20, 20, 15], dtype=np.int32)
 
-        obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
+        obs_arr = self._adapt_obs(self._get_paired_obs(uid)[np.newaxis, :], self.ego_policy)
         obs_t = torch.from_numpy(obs_arr).float().to(self.device)
         mask_t = torch.ones((1, 1), dtype=torch.float32).to(self.device)
         rnn_t = torch.from_numpy(self._ego_rnn).to(self.device)
@@ -473,7 +491,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                 return _discrete_to_normalized(act_cont)
             return np.array([20, 20, 20, 15], dtype=np.int32)
 
-        obs_arr = self._get_paired_obs(uid)[np.newaxis, :]
+        obs_arr = self._adapt_obs(self._get_paired_obs(uid)[np.newaxis, :], self.enm_policy)
         obs_t = torch.from_numpy(obs_arr).float().to(self.device)
         mask_t = torch.ones((1, 1), dtype=torch.float32).to(self.device)
         rnn_t = torch.from_numpy(self._enm_rnn).to(self.device)
