@@ -258,14 +258,14 @@ class TacticalDashboard:
             lon=[v["lon"] for _, v in fb],
             lat=[v["lat"] for _, v in fb],
             mode="markers+text",
-            marker=dict(size=14, color="#1a6fd4", symbol="airport"),
-            text=[n for n, _ in fb],
+            marker=dict(size=18, color="#1a6fd4", symbol="circle"),
+            text=["✈ " + n for n, _ in fb],
             textposition="top right",
-            textfont=dict(size=10, color="#ffffff"),
+            textfont=dict(size=11, color="#89b4fa"),
             name="아군 기지",
-            hovertext=[f"아군 {n}" for n, _ in fb],
+            hovertext=[f"아군 기지: {n}" for n, _ in fb],
             hoverinfo="text",
-            showlegend=False,
+            showlegend=True,
         ))
 
         # ── Trace 2: 적군 기지 (항상 고정) ───────────────────────────
@@ -274,14 +274,14 @@ class TacticalDashboard:
             lon=[v["lon"] for _, v in eb],
             lat=[v["lat"] for _, v in eb],
             mode="markers+text",
-            marker=dict(size=14, color="#c0392b", symbol="airport"),
-            text=[n for n, _ in eb],
+            marker=dict(size=18, color="#c0392b", symbol="circle"),
+            text=["✈ " + n for n, _ in eb],
             textposition="top right",
-            textfont=dict(size=10, color="#ffffff"),
+            textfont=dict(size=11, color="#f38ba8"),
             name="적군 기지",
-            hovertext=[f"적군 {n}" for n, _ in eb],
+            hovertext=[f"적군 기지: {n}" for n, _ in eb],
             hoverinfo="text",
-            showlegend=False,
+            showlegend=True,
         ))
 
         # 항공기 분류
@@ -302,22 +302,26 @@ class TacticalDashboard:
             )
 
         # ── Trace 3·4·5·6: 항공기 (빈 배열이어도 항상 4개 trace 유지) ──
-        for group, color, symbol, label in [
-            (alive_f, "#00b4ff", "triangle", "아군 (생존)"),
-            (dead_f,  "#7fb8d4", "x",        "아군 (손실)"),
-            (alive_e, "#ff3030", "triangle", "적군 (생존)"),
-            (dead_e,  "#d47f7f", "x",        "적군 (손실)"),
+        # Scattermapbox는 open-street-map 스타일에서 "circle" 만 지원
+        # 기체 구분은 마커 크기·색상·텍스트 이모지로 표현
+        for group, color, emoji, label, sz in [
+            (alive_f, "#00b4ff", "▲", "아군 (생존)", 16),
+            (dead_f,  "#7fb8d4", "✕", "아군 (손실)",  9),
+            (alive_e, "#ff3030", "▲", "적군 (생존)", 16),
+            (dead_e,  "#d47f7f", "✕", "적군 (손실)",  9),
         ]:
             fig.add_trace(go.Scattermapbox(
                 lon=[s["lon"] for s in group],
                 lat=[s["lat"] for s in group],
-                mode="markers",
-                marker=dict(size=16 if "생존" in label else 10,
-                            color=color, symbol=symbol),
+                mode="markers+text",
+                marker=dict(size=sz, color=color, symbol="circle"),
+                text=[emoji] * len(group),
+                textposition="middle center",
+                textfont=dict(size=10, color="#ffffff"),
                 name=label,
                 hovertext=[_hover(s) for s in group],
                 hoverinfo="text" if group else "skip",
-                showlegend=bool(group),
+                showlegend=True,
             ))
 
         fig.update_layout(
