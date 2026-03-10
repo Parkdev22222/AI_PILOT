@@ -224,107 +224,102 @@ class TacticalDashboard:
     # ------------------------------------------------------------------
 
     def _make_map_figure(self) -> go.Figure:
-        states     = self._states()
-        zones      = self._detect_combat_zones(states)
+        states = self._states()
+        zones  = self._detect_combat_zones(states)
 
         fig = go.Figure()
 
-        # ── 교전 구역 원 ──────────────────────────────────────────────
+        # ── Trace 0: 교전 구역 (항상 단일 trace, None 구분자로 여러 원 연결) ──
+        zone_lons: List[Optional[float]] = []
+        zone_lats: List[Optional[float]] = []
         for zone in zones:
             lons, lats = _circle_coords(
                 zone["center_lon"], zone["center_lat"], zone["radius_km"]
             )
+            if zone_lons:
+                zone_lons.append(None)
+                zone_lats.append(None)
+            zone_lons.extend(lons)
+            zone_lats.extend(lats)
+        fig.add_trace(go.Scattermapbox(
+            lon=zone_lons, lat=zone_lats,
+            mode="lines",
+            line=dict(color="rgba(255,0,0,0.9)", width=2),
+            fill="toself",
+            fillcolor="rgba(255,0,0,0.12)",
+            name="교전구역",
+            hoverinfo="skip",
+            showlegend=bool(zones),
+        ))
+
+        # ── Trace 1: 아군 기지 (항상 고정) ───────────────────────────
+        fb = list(FRIENDLY_BASES.items())
+        fig.add_trace(go.Scattermapbox(
+            lon=[v["lon"] for _, v in fb],
+            lat=[v["lat"] for _, v in fb],
+            mode="markers+text",
+            marker=dict(size=14, color="#1a6fd4", symbol="airport"),
+            text=[n for n, _ in fb],
+            textposition="top right",
+            textfont=dict(size=10, color="#ffffff"),
+            name="아군 기지",
+            hovertext=[f"아군 {n}" for n, _ in fb],
+            hoverinfo="text",
+            showlegend=False,
+        ))
+
+        # ── Trace 2: 적군 기지 (항상 고정) ───────────────────────────
+        eb = list(ENEMY_BASES.items())
+        fig.add_trace(go.Scattermapbox(
+            lon=[v["lon"] for _, v in eb],
+            lat=[v["lat"] for _, v in eb],
+            mode="markers+text",
+            marker=dict(size=14, color="#c0392b", symbol="airport"),
+            text=[n for n, _ in eb],
+            textposition="top right",
+            textfont=dict(size=10, color="#ffffff"),
+            name="적군 기지",
+            hovertext=[f"적군 {n}" for n, _ in eb],
+            hoverinfo="text",
+            showlegend=False,
+        ))
+
+        # 항공기 분류
+        alive_f = [s for s in states if s["team"] == "friendly" and     s["is_alive"]]
+        dead_f  = [s for s in states if s["team"] == "friendly" and not s["is_alive"]]
+        alive_e = [s for s in states if s["team"] == "enemy"    and     s["is_alive"]]
+        dead_e  = [s for s in states if s["team"] == "enemy"    and not s["is_alive"]]
+
+        def _hover(s: Dict) -> str:
+            return (
+                f"<b>{s['aircraft_uid']}</b><br>"
+                f"팀: {'아군' if s['team']=='friendly' else '적군'}<br>"
+                f"고도: {s.get('alt',0):.0f}m<br>"
+                f"속도: {s.get('speed_mps',0):.0f}m/s<br>"
+                f"미사일: {s.get('missiles_left',0)}발<br>"
+                f"단계: {_PHASE_KO.get(s.get('flight_phase','unknown'),'-')}<br>"
+                f"기지: {s.get('base_name','-')}"
+            )
+
+        # ── Trace 3·4·5·6: 항공기 (빈 배열이어도 항상 4개 trace 유지) ──
+        for group, color, symbol, label in [
+            (alive_f, "#00b4ff", "triangle", "아군 (생존)"),
+            (dead_f,  "#7fb8d4", "x",        "아군 (손실)"),
+            (alive_e, "#ff3030", "triangle", "적군 (생존)"),
+            (dead_e,  "#d47f7f", "x",        "적군 (손실)"),
+        ]:
             fig.add_trace(go.Scattermapbox(
-                lon=lons, lat=lats,
-                mode="lines",
-                line=dict(color="rgba(255,0,0,0.9)", width=2),
-                fill="toself",
-                fillcolor="rgba(255,0,0,0.12)",
-                name="교전구역",
-                hoverinfo="text",
-                hovertext=zone["label"],
-                showlegend=True,
+                lon=[s["lon"] for s in group],
+                lat=[s["lat"] for s in group],
+                mode="markers",
+                marker=dict(size=16 if "생존" in label else 10,
+                            color=color, symbol=symbol),
+                name=label,
+                hovertext=[_hover(s) for s in group],
+                hoverinfo="text" if group else "skip",
+                showlegend=bool(group),
             ))
 
-        # ── 기지 마커 ─────────────────────────────────────────────────
-        for base_name, info in _ALL_BASES.items():
-            is_friendly = info["team"] == "friendly"
-            fig.add_trace(go.Scattermapbox(
-                lon=[info["lon"]],
-                lat=[info["lat"]],
-                mode="markers+text",
-                marker=dict(
-                    size=14,
-                    color="#1a6fd4" if is_friendly else "#c0392b",
-                    symbol="airport",
-                ),
-                text=[base_name],
-                textposition="top right",
-                textfont=dict(size=10, color="#ffffff"),
-                name=f"{'아군' if is_friendly else '적군'} 기지",
-                hovertext=f"{'아군' if is_friendly else '적군'} {base_name}",
-                hoverinfo="text",
-                showlegend=False,
-            ))
-
-        # ── 항공기 마커 ───────────────────────────────────────────────
-        if states:
-            for team, color_alive, color_dead in [
-                ("friendly", "#00b4ff", "#7fb8d4"),
-                ("enemy",    "#ff3030", "#d47f7f"),
-            ]:
-                team_states = [s for s in states if s["team"] == team]
-                if not team_states:
-                    continue
-
-                alive = [s for s in team_states if s["is_alive"]]
-                dead  = [s for s in team_states if not s["is_alive"]]
-
-                if alive:
-                    phase_symbols = [
-                        _PHASE_SYMBOL.get(s.get("flight_phase", "unknown"), "circle")
-                        for s in alive
-                    ]
-                    hover_texts = [
-                        (
-                            f"<b>{s['aircraft_uid']}</b><br>"
-                            f"팀: {'아군' if team == 'friendly' else '적군'}<br>"
-                            f"고도: {s.get('alt', 0):.0f}m<br>"
-                            f"속도: {s.get('speed_mps', 0):.0f}m/s<br>"
-                            f"미사일: {s.get('missiles_left', 0)}발<br>"
-                            f"단계: {_PHASE_KO.get(s.get('flight_phase','unknown'), '-')}<br>"
-                            f"기지: {s.get('base_name', '-')}"
-                        )
-                        for s in alive
-                    ]
-                    fig.add_trace(go.Scattermapbox(
-                        lon=[s["lon"] for s in alive],
-                        lat=[s["lat"] for s in alive],
-                        mode="markers",
-                        marker=dict(
-                            size=16,
-                            color=color_alive,
-                            symbol=phase_symbols[0],   # mapbox는 trace당 단일 심벌
-                        ),
-                        name=f"{'아군' if team == 'friendly' else '적군'} (생존)",
-                        hovertext=hover_texts,
-                        hoverinfo="text",
-                        showlegend=True,
-                    ))
-
-                if dead:
-                    fig.add_trace(go.Scattermapbox(
-                        lon=[s["lon"] for s in dead],
-                        lat=[s["lat"] for s in dead],
-                        mode="markers",
-                        marker=dict(size=10, color=color_dead, symbol="x"),
-                        name=f"{'아군' if team == 'friendly' else '적군'} (손실)",
-                        hovertext=[s["aircraft_uid"] for s in dead],
-                        hoverinfo="text",
-                        showlegend=True,
-                    ))
-
-        # ── 레이아웃 ──────────────────────────────────────────────────
         fig.update_layout(
             mapbox=dict(
                 style="open-street-map",
@@ -344,12 +339,7 @@ class TacticalDashboard:
                 xanchor="left", yanchor="top",
             ),
             height=650,
-            uirevision="map",       # 갱신 시 뷰포트(줌/패닝) 유지
-            transition=dict(        # 트레이스 데이터 변경 시 부드럽게 전환
-                duration=400,
-                easing="cubic-in-out",
-                ordering="traces first",
-            ),
+            uirevision="map",  # 항상 동일 → 사용자 줌/패닝 유지
         )
         return fig
 
@@ -637,12 +627,20 @@ class TacticalDashboard:
         body, .gradio-container { background:#1e1e2e !important; color:#cdd6f4; }
         footer { display:none !important; }
 
-        /* ── 갱신 중 깜빡임 억제 ── */
-        .generating, .generating * { opacity: 1 !important; }
-        .wrap.generating > div     { opacity: 1 !important; transition: none !important; }
-        .gr-plot > div, .svelte-1gfkn6j { transition: opacity 0.25s ease !important; }
-        /* HTML 컴포넌트 교체 시 부드러운 페이드 */
-        .gr-html { transition: opacity 0.2s ease; }
+        /* ── 깜빡임 완전 제거: 모든 애니메이션·전환 비활성화 ── */
+        *, *::before, *::after {
+          animation: none !important;
+          animation-duration: 0s !important;
+          transition: none !important;
+          transition-duration: 0s !important;
+        }
+        /* 예외: 생존율 막대 너비 전환만 유지 */
+        .bar-fill { transition: width 0.4s ease !important; }
+        /* 로딩 스피너 숨김 */
+        .loader, .loader-wrap, svg.loader-spinner { display:none !important; }
+        /* 로딩 중 opacity 강제 유지 */
+        .block, .wrap, .block.generating, .block.pending,
+        .wrap.generating, .wrap.pending { opacity:1 !important; }
 
         /* ── 헤더 ── */
         .header-md h1 { color:#89b4fa; margin-bottom:2px; }
@@ -697,12 +695,83 @@ class TacticalDashboard:
         }
         """
 
-        # 초기화 JS: sessionStorage 기본값 설정 (첫 로드 시 맨 아래 자동 스크롤 허용)
         init_js = """
 () => {
+  /* ── 이벤트 로그 스크롤 초기값 ── */
   if (sessionStorage.getItem('evAtBottom') === null) {
     sessionStorage.setItem('evAtBottom', '1');
   }
+
+  /* ── 지도 줌/패닝 보존 ──
+   * Plotly.react() 후에도 사용자가 설정한 뷰포트를 유지한다.
+   * window.Plotly 없이 Plotly가 DOM 노드에 추가하는 .on() API +
+   * Mapbox GL JS의 jumpTo()를 직접 사용한다.
+   */
+  window._tvp = null;   // 마지막으로 저장한 뷰포트
+
+  function setupMapListeners(div) {
+    if (div._tvpReady) return;
+    div._tvpReady = true;
+
+    var restoring = false;
+    var saveTimer = null;
+
+    function getMap() {
+      try { return div._fullLayout.mapbox._subplot.map; } catch(e) { return null; }
+    }
+
+    function saveViewport() {
+      var map = getMap();
+      if (!map) return;
+      window._tvp = {
+        center: [map.getCenter().lng, map.getCenter().lat],
+        zoom:    map.getZoom(),
+        bearing: map.getBearing(),
+        pitch:   map.getPitch(),
+      };
+    }
+
+    function restoreViewport() {
+      if (!window._tvp) return;
+      var map = getMap();
+      if (!map) return;
+      restoring = true;
+      map.jumpTo({
+        center:  window._tvp.center,
+        zoom:    window._tvp.zoom,
+        bearing: window._tvp.bearing,
+        pitch:   window._tvp.pitch,
+      });
+      setTimeout(function() { restoring = false; }, 600);
+    }
+
+    /* Plotly가 DOM 노드에 .on() 을 추가할 때까지 대기 */
+    var chk = setInterval(function() {
+      if (typeof div.on !== 'function') return;
+      clearInterval(chk);
+
+      /* 사용자 인터랙션(줌/패닝) 후 250ms 디바운스로 저장 */
+      div.on('plotly_relayout', function() {
+        if (restoring) return;
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(saveViewport, 250);
+      });
+
+      /* Plotly.react() 완료 후 뷰포트 복원 */
+      div.on('plotly_afterplot', function() {
+        restoreViewport();
+      });
+    }, 100);
+  }
+
+  /* Plotly 차트 div(.js-plotly-plot)가 DOM에 나타나면 리스너 등록 */
+  var obs = new MutationObserver(function() {
+    var d = document.querySelector('.js-plotly-plot');
+    if (d) setupMapListeners(d);
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+  var d = document.querySelector('.js-plotly-plot');
+  if (d) setupMapListeners(d);
 }
 """
         with gr.Blocks(
@@ -759,12 +828,11 @@ class TacticalDashboard:
             # ── 이벤트 로그 (스크롤 가능) ─────────────────────────────
             event_html = gr.HTML(elem_id="event-log")
 
-            # ── 자동 갱신 ──────────────────────────────────────────────
-            demo.load(
+            # ── 자동 갱신 (gr.Timer) ───────────────────────────────────
+            timer = gr.Timer(value=self.refresh_interval)
+            timer.tick(
                 fn=self._refresh,
-                inputs=None,
                 outputs=[map_plot, status_html, event_html],
-                every=self.refresh_interval,
             )
 
         return demo
