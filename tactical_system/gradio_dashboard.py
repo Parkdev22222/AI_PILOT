@@ -676,14 +676,31 @@ class TacticalDashboard:
   </div>
 </div>"""
 
-    def _make_event_rows(self) -> str:
-        """<tbody> 내부 <tr> 행들만 반환 — JS가 ev-tbody.innerHTML에 삽입."""
-        import html as _html
-        events = self._events()
-        if not events:
-            return "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>"
+    # LLM 판단 유형 한글명
+    _LLM_DECISION_TYPE_KO = {
+        "dispatch":              "초기 출격 결정",
+        "formation_assignment":  "편대 배정",
+        "major_loss":            "전력 50% 손실 대응",
+        "ammo_depleted":         "무장 고갈 대응",
+        "formation_ammo_depleted": "편대 무장 고갈 대응",
+        "formation_destroyed":   "편대 전멸 교체 결정",
+    }
 
-        rows_html = ""
+    def _make_event_rows(self) -> str:
+        """
+        <tbody> 내부 <tr> 행들 반환 — JS가 ev-tbody.innerHTML에 삽입.
+
+        전술 이벤트(events 테이블) + LLM 판단(llm_decisions 테이블)을
+        스텝 순서로 통합하여 표시.
+        - 전술 이벤트: 기존 스타일 유지
+        - LLM 판단: 보라색(event-llm) 별도 스타일로 구분
+        """
+        import html as _html
+
+        # ── 전술 이벤트 행 수집 ───────────────────────────────────────
+        events = self._events()
+        rows: List[Dict] = []
+
         for e in events:
             etype   = _EVENT_TYPE_KO.get(e.get("event_type", ""), e.get("event_type", "-"))
             details = e.get("details_json", {})
@@ -698,6 +715,11 @@ class TacticalDashboard:
                     )
                 elif "aircraft_uid" in details:
                     detail_str = f"{_html.escape(str(details['aircraft_uid']))} 무장 고갈"
+                elif "friendly_base" in details and "alive_enemy" in details:
+                    detail_str = (
+                        f"{_html.escape(str(details.get('friendly_base','?')))} 편대 "
+                        f"(잔여 적기 {details.get('alive_enemy','?')}대)"
+                    )
                 else:
                     detail_str = _html.escape(str(details)[:60])
             else:
@@ -707,25 +729,96 @@ class TacticalDashboard:
                 "rtb":             "전체 RTB",
                 "request_support": "지원 요청",
                 "continue":        "임무 지속",
-            }.get(dec.get("action", ""), _html.escape(dec.get("action", "-")) if dec else "-")
+            }.get(dec.get("action", ""),
+                  _html.escape(str(dec.get("action", "-"))) if dec else "-")
 
             resolved_badge = (
                 "<span class='badge-ok'>완료</span>"
                 if e.get("resolved")
                 else "<span class='badge-wait'>대기</span>"
             )
-            type_class = "event-loss" if "손실" in etype else "event-ammo"
+            type_class = "event-loss" if "손실" in etype or "전멸" in etype else "event-ammo"
 
-            rows_html += (
-                f"<tr>"
-                f"<td>{e.get('step','-')}</td>"
-                f"<td class='{type_class}'>{_html.escape(etype)}</td>"
-                f"<td>{detail_str}</td>"
-                f"<td>{action_ko}</td>"
-                f"<td>{resolved_badge}</td>"
-                f"</tr>\n"
+            rows.append({
+                "step": e.get("step", 0),
+                "html": (
+                    f"<tr>"
+                    f"<td>{e.get('step','-')}</td>"
+                    f"<td class='{type_class}'>{_html.escape(etype)}</td>"
+                    f"<td>{detail_str}</td>"
+                    f"<td>{action_ko}</td>"
+                    f"<td>{resolved_badge}</td>"
+                    f"</tr>\n"
+                ),
+            })
+
+        # ── LLM 판단 행 수집 ─────────────────────────────────────────
+        for d in self._llm_decisions():
+            dtype   = d.get("decision_type", "")
+            type_ko = self._LLM_DECISION_TYPE_KO.get(dtype, dtype)
+            step_v  = d.get("step", 0)
+
+            # 출력 파싱
+            try:
+                out = json.loads(d.get("output_decision", "{}"))
+            except Exception:
+                out = {}
+
+            # 세부 내용: 판단 유형별 요약
+            if dtype == "dispatch":
+                pairs = out.get("friendly_dispatch", [])
+                detail_str = " | ".join(
+                    f"{_html.escape(p.get('base','?'))} → {_html.escape(p.get('oppose','?'))}"
+                    for p in pairs
+                ) or "-"
+            elif dtype == "formation_assignment":
+                pairs = out.get("assignment", [])
+                detail_str = " | ".join(
+                    f"{_html.escape(p.get('friendly_base','?'))} ↔ {_html.escape(p.get('enemy_base','?'))}"
+                    for p in pairs
+                ) or "-"
+            elif dtype == "formation_destroyed":
+                chosen = _html.escape(str(out.get("base", "-")))
+                detail_str = f"교체 기지: {chosen}"
+            else:
+                detail_str = "-"
+
+            # 결정 내용
+            action = out.get("action", "")
+            action_ko = {
+                "rtb":             "RTB 명령",
+                "request_support": "지원 요청",
+                "continue":        "임무 지속",
+            }.get(action, "")
+            if not action_ko:
+                # dispatch / assignment 등은 detail에 이미 표현됨
+                action_ko = _html.escape(str(out.get("base", action or "-")))
+
+            # 근거 (최대 60자)
+            reasoning = _html.escape(
+                (d.get("reasoning") or out.get("reasoning", ""))[:60]
             )
-        return rows_html
+            detail_full = f"{detail_str}<br><span style='color:#a6adc8;font-size:0.78rem'>{reasoning}</span>"
+
+            rows.append({
+                "step": step_v,
+                "html": (
+                    f"<tr class='ev-row-llm'>"
+                    f"<td>{step_v}</td>"
+                    f"<td class='event-llm'>🤖 {_html.escape(type_ko)}</td>"
+                    f"<td>{detail_full}</td>"
+                    f"<td>{action_ko}</td>"
+                    f"<td><span class='badge-llm'>LLM</span></td>"
+                    f"</tr>\n"
+                ),
+            })
+
+        if not rows:
+            return "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>"
+
+        # 스텝 오름차순 정렬 후 HTML 조합
+        rows.sort(key=lambda r: r["step"])
+        return "".join(r["html"] for r in rows)
 
     # ------------------------------------------------------------------
     # 데이터 페이로드: status + events 를 단일 JSON으로 묶어 반환
@@ -868,6 +961,7 @@ class TacticalDashboard:
         .event-tbl tr:hover td { background:#383850; }
         .event-loss  { color:#f38ba8; font-weight:600; }
         .event-ammo  { color:#fab387; font-weight:600; }
+        .event-llm   { color:#cba6f7; font-weight:600; }
         .no-event    { text-align:center; color:#585b70; padding:16px; }
         .badge-ok    {
           background:#a6e3a1; color:#1e1e2e; border-radius:4px;
@@ -877,6 +971,12 @@ class TacticalDashboard:
           background:#f9e2af; color:#1e1e2e; border-radius:4px;
           padding:1px 6px; font-size:0.75rem; font-weight:700;
         }
+        .badge-llm   {
+          background:#cba6f7; color:#1e1e2e; border-radius:4px;
+          padding:1px 6px; font-size:0.75rem; font-weight:700;
+        }
+        .ev-row-llm td { background:#2a2a3e !important; }
+        .ev-row-llm:hover td { background:#32324a !important; }
         """
 
         init_js = """
