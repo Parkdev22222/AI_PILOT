@@ -176,51 +176,82 @@ class TacticalDashboard:
 
     def _detect_combat_zones(self, states: List[Dict]) -> List[Dict]:
         """
-        flight_phase == 'combat' 인 기체들의 편대쌍 중심을 교전 구역으로 반환.
+        LLM이 assign_formation_targets()로 짝지은 아군-적군 편대 쌍 기준으로
+        교전 구역을 계산. DB formation_info.paired_enemy_id 를 사용.
         [{center_lon, center_lat, radius_km, label}, …]
         """
         if not states:
             return []
 
-        combat_friendly = [
-            s for s in states
-            if s["team"] == "friendly"
-            and s.get("flight_phase") == "combat"
-            and s["is_alive"]
-        ]
-        combat_enemy = [
-            s for s in states
-            if s["team"] == "enemy"
-            and s.get("flight_phase") == "combat"
-            and s["is_alive"]
-        ]
+        # ── LLM 배정 기반: formation_info 의 paired_enemy_id 활용 ────────
+        formations = self._formations()
+        friendly_fmts = [f for f in formations if f["team"] == "friendly"
+                         and f.get("paired_enemy_id") is not None]
 
-        if not combat_friendly or not combat_enemy:
-            # 거리 기반 fallback: 20km 이내 pair
+        if friendly_fmts:
+            # formation_id → 해당 편대 생존 기체 위치 목록
+            state_by_fid: Dict[int, List[Dict]] = {}
+            for s in states:
+                if not s["is_alive"]:
+                    continue
+                fid = s.get("formation_id")
+                if fid is not None:
+                    state_by_fid.setdefault(fid, []).append(s)
+
             zones = []
-            alive_f = [s for s in states if s["team"] == "friendly" and s["is_alive"]]
-            alive_e = [s for s in states if s["team"] == "enemy"    and s["is_alive"]]
-            seen = set()
-            for f in alive_f:
-                for e in alive_e:
-                    dist = _haversine_km(f["lon"], f["lat"], e["lon"], e["lat"])
-                    if dist <= 20.0:
-                        key = (round(f["lon"], 2), round(f["lat"], 2))
-                        if key not in seen:
-                            clon = (f["lon"] + e["lon"]) / 2
-                            clat = (f["lat"] + e["lat"]) / 2
-                            zones.append({
-                                "center_lon": clon, "center_lat": clat,
-                                "radius_km": 20.0,
-                                "label": f"교전구역 ({dist:.0f}km)",
-                            })
-                            seen.add(key)
-            return zones
+            for fmt in friendly_fmts:
+                f_fid = fmt["formation_id"]
+                e_fid = fmt["paired_enemy_id"]
+                f_alive = state_by_fid.get(f_fid, [])
+                e_alive = state_by_fid.get(e_fid, [])
+                if not f_alive and not e_alive:
+                    continue
+                combined = f_alive + e_alive
+                clon = float(np.mean([s["lon"] for s in combined]))
+                clat = float(np.mean([s["lat"] for s in combined]))
+                f_base = fmt.get("base_name", "?")
+                # 적군 편대 기지명
+                e_fmt = next((f for f in formations if f["formation_id"] == e_fid), {})
+                e_base = e_fmt.get("base_name", "?")
+                zones.append({
+                    "center_lon": clon,
+                    "center_lat": clat,
+                    "radius_km": 20.0,
+                    "label": f"{f_base} vs {e_base}",
+                })
+            if zones:
+                return zones
 
-        clon = float(np.mean([s["lon"] for s in combat_friendly + combat_enemy]))
-        clat = float(np.mean([s["lat"] for s in combat_friendly + combat_enemy]))
-        return [{"center_lon": clon, "center_lat": clat,
-                 "radius_km": 20.0, "label": "교전구역"}]
+        # ── Fallback: flight_phase == 'combat' 기체 기반 ─────────────────
+        combat_f = [s for s in states if s["team"] == "friendly"
+                    and s.get("flight_phase") == "combat" and s["is_alive"]]
+        combat_e = [s for s in states if s["team"] == "enemy"
+                    and s.get("flight_phase") == "combat" and s["is_alive"]]
+        if combat_f and combat_e:
+            clon = float(np.mean([s["lon"] for s in combat_f + combat_e]))
+            clat = float(np.mean([s["lat"] for s in combat_f + combat_e]))
+            return [{"center_lon": clon, "center_lat": clat,
+                     "radius_km": 20.0, "label": "교전구역"}]
+
+        # ── Fallback: 20km 이내 근접 기체 쌍 ────────────────────────────
+        zones = []
+        alive_f = [s for s in states if s["team"] == "friendly" and s["is_alive"]]
+        alive_e = [s for s in states if s["team"] == "enemy"    and s["is_alive"]]
+        seen: set = set()
+        for f in alive_f:
+            for e in alive_e:
+                dist = _haversine_km(f["lon"], f["lat"], e["lon"], e["lat"])
+                if dist <= 20.0:
+                    key = (round(f["lon"], 1), round(f["lat"], 1))
+                    if key not in seen:
+                        zones.append({
+                            "center_lon": (f["lon"] + e["lon"]) / 2,
+                            "center_lat": (f["lat"] + e["lat"]) / 2,
+                            "radius_km": 20.0,
+                            "label": f"교전구역 ({dist:.0f}km)",
+                        })
+                        seen.add(key)
+        return zones
 
     # ------------------------------------------------------------------
     # 탭 1: 지도 생성 (matplotlib — JS/Plotly 버전 충돌 없이 PNG로 렌더링)
