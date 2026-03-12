@@ -845,16 +845,23 @@ class TacticalDashboard:
   }
 }
 """
-        # Gradio 6.0에서 theme/css/js 는 launch()에 전달 (Blocks에서 제거됨)
-        # launch() 호출 시 사용할 수 있도록 인스턴스에 저장
-        self._ui_theme = gr.themes.Base(
+        # Gradio 버전별로 theme/css/js 허용 위치가 다름:
+        #   < 6.0 : Blocks(theme=, css=, js=)
+        #   6.0+  : launch(theme=, css=, js=)
+        # → inspect 로 각 시그니처를 확인해 런타임에 자동 분배
+        import inspect
+        theme = gr.themes.Base(
             primary_hue=gr.themes.colors.blue,
             neutral_hue=gr.themes.colors.slate,
         )
-        self._ui_css = css
-        self._ui_js  = init_js
+        ui_kwargs = {"theme": theme, "css": css, "js": init_js}
+        _blocks_params = inspect.signature(gr.Blocks.__init__).parameters
+        _launch_params = inspect.signature(gr.Blocks.launch).parameters
 
-        with gr.Blocks(title="한반도 전술 공중전 시뮬레이터") as demo:
+        blocks_extra = {k: v for k, v in ui_kwargs.items() if k in _blocks_params}
+        self._launch_ui  = {k: v for k, v in ui_kwargs.items() if k in _launch_params and k not in blocks_extra}
+
+        with gr.Blocks(title="한반도 전술 공중전 시뮬레이터", **blocks_extra) as demo:
 
             # ── 헤더 ──────────────────────────────────────────────────
             gr.Markdown(
@@ -928,8 +935,6 @@ class TacticalDashboard:
             server_name="0.0.0.0",
             server_port=server_port,
             share=share,
-            theme=self._ui_theme,
-            css=self._ui_css,
-            js=self._ui_js,
+            **self._launch_ui,   # 버전별로 해당되는 theme/css/js 만 전달
             **kwargs,
         )
