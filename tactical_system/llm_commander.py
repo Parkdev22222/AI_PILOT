@@ -353,6 +353,116 @@ class LLMCommander:
         return assignment
 
     # ------------------------------------------------------------------
+    # 4단계: 아군 편대 전멸 → 교체 편대 출격 기지 결정
+    # ------------------------------------------------------------------
+
+    def decide_on_formation_destroyed(
+        self,
+        event_id: int,
+        pair_idx: int,
+        destroyed_base: str,
+        enemy_base: str,
+        alive_enemy_count: int,
+        available_bases: List[str],
+        step: int,
+        timestamp: float,
+    ) -> Dict:
+        """
+        아군 편대 전멸 시 교체 편대 출격 기지를 LLM이 결정.
+
+        Parameters
+        ----------
+        event_id          : DB 이벤트 ID
+        pair_idx          : 전멸된 편대쌍 인덱스
+        destroyed_base    : 전멸된 편대의 원래 기지명
+        enemy_base        : 교전 중인 적 기지명
+        alive_enemy_count : 남은 적기 수
+        available_bases   : 출격 가능한 아군 기지 목록
+        step, timestamp   : 현재 시뮬레이션 스텝 / 시각
+
+        Returns
+        -------
+        dict  예시:
+          {
+            "base": "청주공군기지",
+            "reasoning": "…"
+          }
+        """
+        if not available_bases:
+            return {"base": "", "reasoning": "가용 기지 없음"}
+
+        base_info_lines = "\n".join(
+            f"  - {b}: {FRIENDLY_BASES.get(b, {}).get('description', b)} "
+            f"(경도 {FRIENDLY_BASES.get(b, {}).get('lon', 0):.2f}°, "
+            f"위도 {FRIENDLY_BASES.get(b, {}).get('lat', 0):.2f}°)"
+            for b in available_bases
+        )
+        e_info = ENEMY_BASES.get(enemy_base, {})
+        e_desc = e_info.get("description", enemy_base)
+        e_lon  = e_info.get("lon", 0)
+        e_lat  = e_info.get("lat", 0)
+
+        system_prompt = (
+            "당신은 대한민국 공군 전술 지휘관 AI입니다. "
+            "아군 편대가 전멸한 상황에서 교체 편대 출격 기지를 선택하십시오. "
+            "반드시 JSON 형식으로만 응답하십시오."
+        )
+        user_prompt = f"""
+긴급 상황 보고:
+- 시뮬레이션 스텝: {step}
+- 전멸 편대 기지: {destroyed_base}
+- 교전 중인 적 기지: {enemy_base} ({e_desc}, 경도 {e_lon:.2f}°, 위도 {e_lat:.2f}°)
+- 잔여 적기 수: {alive_enemy_count}대
+
+아군 편대가 전멸하였습니다. 즉시 교체 편대를 출격시켜야 합니다.
+출격 가능한 아군 기지 목록:
+{base_info_lines}
+
+위 기지 중 하나를 선택하여 교체 편대를 출격시키십시오.
+지리적 근접성(적 기지까지 거리)과 전술적 효율성을 고려하십시오.
+
+다음 JSON 형식으로 응답하십시오:
+```json
+{{
+  "base": "선택한_아군기지명",
+  "reasoning": "선택 근거"
+}}
+```
+"""
+        raw = self._generate(system_prompt, user_prompt)
+        logger.debug(f"[LLM formation_destroyed response]\n{raw}")
+
+        result = self._extract_json(raw)
+        chosen_base = (result or {}).get("base", "")
+
+        # 유효성 검증: 가용 기지 목록에 없으면 가장 가까운 기지 선택
+        if chosen_base not in available_bases:
+            logger.warning(
+                f"LLM 선택 기지 '{chosen_base}'가 가용 목록에 없음. "
+                f"첫 번째 기지 '{available_bases[0]}' 사용."
+            )
+            chosen_base = available_bases[0]
+            if result is None:
+                result = {}
+            result["base"] = chosen_base
+
+        if result is None:
+            result = {"base": chosen_base, "reasoning": "파싱 실패 — 기본값"}
+
+        if self.db and self.sim_id >= 0:
+            self.db.update_event_decision(event_id, result)
+            self.db.log_llm_decision(
+                sim_id=self.sim_id,
+                step=step,
+                timestamp=timestamp,
+                decision_type="formation_destroyed",
+                input_prompt=user_prompt,
+                output_decision=json.dumps(result, ensure_ascii=False),
+                reasoning=result.get("reasoning", ""),
+            )
+        return result
+
+    # ------------------------------------------------------------------
     # 5단계: 이벤트 발생 → LLM 판단
     # ------------------------------------------------------------------
 

@@ -329,6 +329,11 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_ammo_depleted_ids: Dict[str, int] = {}  # uid → event_id
         # 편대 단위 무장 고갈: pair_idx → event_id
         self.event_formation_ammo_depleted: Dict[int, int] = {}
+        # 아군 편대 전멸: pair_idx → event_id
+        self.event_formation_destroyed: Dict[int, int] = {}
+
+        # 스폰 일련번호 (중복 UID 방지)
+        self._spawn_counter: int = 0
 
         # RL RNN 상태
         n_agents = len(self.ego_ids)
@@ -384,6 +389,8 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_ammo_depleted = False
         self.event_ammo_depleted_ids.clear()
         self.event_formation_ammo_depleted.clear()
+        self.event_formation_destroyed.clear()
+        self._spawn_counter = 0
         self._victory_reassigned.clear()
         self.reload_pending.clear()
         self.reloaded_returning.clear()
@@ -437,6 +444,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         info["event_ammo_depleted"] = self.event_ammo_depleted
         info["event_ammo_depleted_ids"] = dict(self.event_ammo_depleted_ids)
         info["event_formation_ammo_depleted"] = dict(self.event_formation_ammo_depleted)
+        info["event_formation_destroyed"] = dict(self.event_formation_destroyed)
 
         return obs, share_obs, rewards, dones, info
 
@@ -807,6 +815,47 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     f"전 기체 무장 고갈 (event_id={event_id})"
                 )
 
+        # ── 아군 편대 전멸 ─────────────────────────────────────────────
+        # friendly_uids 전원 사망 → formation_destroyed 이벤트
+        for i, pair in enumerate(self.formation_pairs):
+            if i in self.event_formation_destroyed:
+                continue
+            if self.pair_phases[i] in ("rtb_loss", "rtb_ammo", "done"):
+                continue
+            # 편대에 속한 전체 기체 (지원 포함) 가 모두 사망인지 확인
+            all_uids = pair["friendly_uids"]
+            if not all_uids:
+                continue
+            alive_any = any(
+                u in self.agents and self.agents[u].is_alive
+                for u in all_uids
+            )
+            if alive_any:
+                continue
+            # 전멸 확인. 아직 교전 중인 적이 남아있을 때만 이벤트 발생
+            alive_enemy = [
+                u for u in pair["enemy_uids"]
+                if u in self.agents and self.agents[u].is_alive
+            ]
+            if not alive_enemy:
+                continue  # 적도 없음 → 이미 종료
+            details = {
+                "pair_idx": i,
+                "friendly_base": pair["friendly_base"]["name"],
+                "enemy_base": pair["enemy_base"]["name"],
+                "alive_enemy": len(alive_enemy),
+                "enemy_uids": alive_enemy,
+                "step": step,
+            }
+            event_id = self.db.log_event(
+                self.sim_id, step, ts, "formation_destroyed", details
+            )
+            self.event_formation_destroyed[i] = event_id
+            logger.warning(
+                f"[이벤트] 편대 {i} ({pair['friendly_base']['name']}) 전멸 "
+                f"(잔여 적기 {len(alive_enemy)}대, event_id={event_id})"
+            )
+
     # ------------------------------------------------------------------
     # 이벤트 처리 (컨트롤러에서 LLM 결정 후 호출)
     # ------------------------------------------------------------------
@@ -908,6 +957,60 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.pair_phases[pair_idx] = "support"
         logger.info(
             f"[처리] 지원 편대 스폰: {uid_a}, {uid_b} (기지: {support_base['name']})"
+        )
+
+    def handle_spawn_replacement(self, replacement_base: Dict, pair_idx: int):
+        """
+        전멸한 아군 편대를 대체하는 새 편대 스폰.
+
+        handle_request_support() 와 달리 _support_spawned 제한 없이
+        항상 스폰 가능하며, 고유 UID를 생성하기 위해 _spawn_counter 를 사용.
+
+        Parameters
+        ----------
+        replacement_base : {"name":…, "lon":…, "lat":…}
+        pair_idx         : 전멸된 편대쌍 인덱스
+        """
+        pair = self.formation_pairs[pair_idx]
+        combat_lon, combat_lat = self._formation_centroid(pair["enemy_uids"])
+
+        self._spawn_counter += 1
+        uid_a = f"R{pair_idx}_{self._spawn_counter}A"
+        uid_b = f"R{pair_idx}_{self._spawn_counter}B"
+
+        lon0, lat0 = replacement_base["lon"], replacement_base["lat"]
+        init_common = {
+            "ic_long_gc_deg":  lon0,
+            "ic_lat_geod_deg": lat0,
+            "ic_h_sl_ft":      SUPPORT_SPAWN_ALT_M * 3.28084,
+            "ic_psi_true_deg": float(
+                _bearing_rad(lon0, lat0, combat_lon, combat_lat) * 180 / math.pi
+            ),
+            "ic_u_fps": CRUISE_SPEED_FPS,
+        }
+
+        for uid in [uid_a, uid_b]:
+            sim = AircraftSimulator(
+                uid=uid,
+                color="Blue",
+                model="f16",
+                init_state=init_common,
+                origin=(self.center_lon, self.center_lat, self.center_alt),
+                sim_freq=self.sim_freq,
+                num_missiles=2,
+            )
+            for eu in pair["enemy_uids"]:
+                if eu in self.agents and self.agents[eu].is_alive:
+                    sim.enemies.append(self.agents[eu])
+                    self.agents[eu].enemies.append(sim)
+            self.add_temp_simulator(sim)
+            self.agents[uid] = sim
+            pair["friendly_uids"].append(uid)
+
+        self.pair_phases[pair_idx] = "approach"
+        logger.info(
+            f"[처리] 교체 편대 스폰: {uid_a}, {uid_b} "
+            f"(기지: {replacement_base['name']}, pair={pair_idx})"
         )
 
     def handle_ammo_rtb(self, uid: str):

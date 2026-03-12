@@ -293,7 +293,8 @@ class TacticalController:
         # 이벤트 처리 완료 플래그
         self._major_loss_handled: bool = False
         self._ammo_handled_uids: set = set()
-        self._formation_ammo_handled: set = set()  # 처리 완료된 pair_idx
+        self._formation_ammo_handled: set = set()    # 처리 완료된 pair_idx
+        self._formation_destroyed_handled: set = set()  # 처리 완료된 pair_idx
 
     # ------------------------------------------------------------------
     # 메인 루프
@@ -439,6 +440,55 @@ class TacticalController:
             # 무장 고갈된 편대 전체 RTB
             self.env.handle_formation_ammo_rtb(pair_idx)
             self._formation_ammo_handled.add(pair_idx)
+
+        # ── 5.4 아군 편대 전멸 → LLM 교체 편대 출격 ────────────────────
+        formation_destroyed: Dict[int, int] = info.get("event_formation_destroyed", {})
+        for pair_idx_str, event_id in formation_destroyed.items():
+            pair_idx = int(pair_idx_str)
+            if pair_idx in self._formation_destroyed_handled:
+                continue
+            pair = self.formation_pairs[pair_idx]
+            logger.info(
+                f"[이벤트 처리] formation_destroyed "
+                f"pair={pair_idx} ({pair['friendly_base']['name']}) "
+                f"(event_id={event_id})"
+            )
+
+            # 잔여 적기 수
+            alive_enemy_count = sum(
+                1 for u in pair["enemy_uids"]
+                if u in self.env.agents and self.env.agents[u].is_alive
+            )
+
+            # LLM에게 교체 기지 결정 요청
+            # 모든 아군 기지를 후보로 제공 (이미 사용 중이어도 재사용 가능)
+            available = list(FRIENDLY_BASES.keys())
+            decision = self.llm.decide_on_formation_destroyed(
+                event_id=event_id,
+                pair_idx=pair_idx,
+                destroyed_base=pair["friendly_base"]["name"],
+                enemy_base=pair["enemy_base"]["name"],
+                alive_enemy_count=alive_enemy_count,
+                available_bases=available,
+                step=step,
+                timestamp=ts,
+            )
+            chosen_base_name = decision.get("base", "")
+            logger.info(
+                f"LLM 교체 기지 결정: {chosen_base_name} "
+                f"— {decision.get('reasoning', '')}"
+            )
+
+            if chosen_base_name and chosen_base_name in FRIENDLY_BASES:
+                replacement_base = {
+                    "name": chosen_base_name,
+                    **FRIENDLY_BASES[chosen_base_name],
+                }
+                self.env.handle_spawn_replacement(replacement_base, pair_idx)
+            else:
+                logger.warning("교체 기지 결정 실패. 교체 편대 미출격.")
+
+            self._formation_destroyed_handled.add(pair_idx)
 
     # ------------------------------------------------------------------
     # 유틸
