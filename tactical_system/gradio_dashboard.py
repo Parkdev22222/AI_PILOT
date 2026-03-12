@@ -119,10 +119,13 @@ class TacticalDashboard:
         db_path: str = "combat_simulation.db",
         sim_id: int = 1,
         refresh_interval: float = 2.0,
+        start_callback=None,
     ):
         self.db = CombatDB(db_path)
         self.sim_id = sim_id
         self.refresh_interval = refresh_interval
+        self.start_callback = start_callback
+        self._sim_started = False
 
     # ------------------------------------------------------------------
     # 데이터 조회
@@ -979,6 +982,22 @@ class TacticalDashboard:
         }
         .ev-row-llm td { background:#2a2a3e !important; }
         .ev-row-llm:hover td { background:#32324a !important; }
+
+        /* ── 시뮬레이션 시작 버튼 ── */
+        #start-sim-btn {
+          width:100%; margin-top:8px;
+          background:#a6e3a1 !important; color:#1e1e2e !important;
+          border:none !important; border-radius:8px !important;
+          font-size:0.95rem !important; font-weight:700 !important;
+          padding:10px 0 !important; cursor:pointer !important;
+          transition:background 0.2s;
+        }
+        #start-sim-btn:hover { background:#94d3a2 !important; }
+        #start-sim-btn:disabled,
+        #start-sim-btn[disabled] {
+          background:#45475a !important; color:#a6adc8 !important;
+          cursor:not-allowed !important;
+        }
         """
 
         init_js = """
@@ -1187,6 +1206,12 @@ class TacticalDashboard:
                         elem_classes=["legend-md"],
                     )
 
+                    start_btn = gr.Button(
+                        value="▶ 시뮬레이션 시작",
+                        elem_id="start-sim-btn",
+                        interactive=True,
+                    )
+
             # ── 이벤트 로그 (정적 골격, JS가 ev-tbody만 갱신) ─────────
             gr.HTML(
                 value=self._make_event_skeleton(),
@@ -1205,6 +1230,19 @@ class TacticalDashboard:
                 fn=self._refresh,
                 outputs=[map_carrier, data_carrier],
             )
+
+            def _on_start_click():
+                if not self._sim_started:
+                    self._sim_started = True
+                    if self.start_callback:
+                        import threading
+                        t = threading.Thread(
+                            target=self.start_callback, daemon=True, name="SimThread"
+                        )
+                        t.start()
+                return gr.Button(value="⏳ 시뮬레이션 실행 중...", interactive=False)
+
+            start_btn.click(fn=_on_start_click, inputs=[], outputs=[start_btn])
 
         return demo
 

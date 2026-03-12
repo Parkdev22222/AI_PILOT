@@ -15,14 +15,12 @@ TacticalController + Gradio 대시보드 통합 실행 스크립트.
 
 동작 순서:
   1. TacticalController 초기화 (LLM 로드, 적/아군 기지 결정, 환경 생성)
-  2. controller.run() → 백그라운드 데몬 스레드에서 시뮬레이션 루프 실행
-  3. Gradio 대시보드 실행 (DB 폴링으로 실시간 시각화)
+  2. Gradio 대시보드 실행 (DB 폴링으로 실시간 시각화)
+  3. UI 우측 하단 '▶ 시뮬레이션 시작' 버튼 클릭 시 시뮬레이션 스레드 시작
 """
 
 import argparse
 import logging
-import threading
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -102,37 +100,23 @@ def main():
     print(f"  DB 경로       : {args.db_path}")
     print()
 
-    # ── 2. 시뮬레이션 스레드 시작 ────────────────────────────────────
-    def _run_sim():
+    # ── 2. 시뮬레이션 시작 콜백 (UI 버튼 클릭 시 호출) ──────────────
+    def _start_simulation():
         try:
             controller.run()
         except Exception as exc:
             logger.error(f"시뮬레이션 오류: {exc}", exc_info=True)
 
-    sim_thread = threading.Thread(target=_run_sim, daemon=True, name="SimThread")
-    sim_thread.start()
-    print("시뮬레이션 스레드 시작 완료.")
-
-    # DB에 첫 번째 데이터가 기록될 때까지 잠시 대기 (최대 15초)
-    print("DB 데이터 대기 중...", end="", flush=True)
-    for _ in range(30):
-        time.sleep(0.5)
-        states = controller.db.get_latest_aircraft_states(controller.sim_id)
-        if states:
-            print(" 완료!")
-            break
-        print(".", end="", flush=True)
-    else:
-        print(" (타임아웃 — 대시보드를 먼저 시작합니다)")
-
     # ── 3. Gradio 대시보드 실행 ───────────────────────────────────────
     print(f"\nGradio 대시보드 시작: http://0.0.0.0:{args.port}")
+    print("UI 우측 하단 '▶ 시뮬레이션 시작' 버튼을 눌러 시뮬레이션을 시작하세요.")
     print("Ctrl+C 로 종료\n")
 
     dashboard = TacticalDashboard(
         db_path=args.db_path,
         sim_id=controller.sim_id,
         refresh_interval=args.refresh,
+        start_callback=_start_simulation,
     )
     dashboard.launch(
         server_port=args.port,
