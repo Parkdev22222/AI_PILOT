@@ -329,9 +329,10 @@ class TacticalDashboard:
             ))
 
         # ── 지도 레이아웃 (완전 오프라인, Plotly 내장 데이터) ──────────
+        # scope 없이 lonaxis/lataxis.range 로만 뷰 제어:
+        # scope="asia" + 좁은 range 조합이 일부 Plotly 버전에서 흰 화면 유발
         fig.update_layout(
             geo=dict(
-                scope="asia",
                 projection_type="mercator",
                 showland=True,       landcolor="#2d2d44",
                 showocean=True,      oceancolor="#1a1a2e",
@@ -339,7 +340,6 @@ class TacticalDashboard:
                 showcountries=True,  countrycolor="#6272a4",
                 showlakes=False,     showrivers=False,
                 bgcolor="#1e1e2e",
-                # 한반도 중심 초기 뷰
                 lonaxis=dict(range=[124.0, 131.0]),
                 lataxis=dict(range=[34.5, 43.0]),
             ),
@@ -483,62 +483,44 @@ class TacticalDashboard:
         return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
-    # 상태 요약: 정적 골격 (최초 1회 렌더) + 데이터 JSON (타이머마다 갱신)
+    # 상태 요약 HTML (타이머마다 gr.HTML 직접 교체)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _make_status_skeleton() -> str:
-        return """
-<div class='status-box'>
-  <div class='status-title'>📡 전투 현황 (스텝: <span id='s-step'>-</span>)</div>
-  <table class='status-tbl'>
-    <tr>
-      <td class='blue-text'>🔵 아군</td>
-      <td>
-        <div class='bar-wrap'>
-          <div class='bar-fill blue-bar' id='s-bar-f' style='width:0%'></div>
-        </div>
-      </td>
-      <td class='cnt blue-text' id='s-cnt-f'>-/-</td>
-    </tr>
-    <tr>
-      <td class='red-text'>🔴 적군</td>
-      <td>
-        <div class='bar-wrap'>
-          <div class='bar-fill red-bar' id='s-bar-e' style='width:0%'></div>
-        </div>
-      </td>
-      <td class='cnt red-text' id='s-cnt-e'>-/-</td>
-    </tr>
-  </table>
-</div>"""
-
-    def _make_status_data(self) -> str:
-        """JS가 읽을 JSON 문자열 반환 — DOM 직접 갱신에 사용."""
+    def _make_status_html(self) -> str:
+        """현재 DB 데이터로 상태 박스 전체 HTML 생성."""
         states = self._states()
-        if not states:
-            return json.dumps({"step": "-", "bar_f": 0, "bar_e": 0,
-                               "cnt_f": "-/-", "cnt_e": "-/-"})
         alive_f = sum(1 for s in states if s["team"] == "friendly" and s["is_alive"])
         total_f = sum(1 for s in states if s["team"] == "friendly")
         alive_e = sum(1 for s in states if s["team"] == "enemy"    and s["is_alive"])
         total_e = sum(1 for s in states if s["team"] == "enemy")
-        step    = max((s.get("step", 0) for s in states), default=0)
-        return json.dumps({
-            "step":  step,
-            "bar_f": int(alive_f / max(total_f, 1) * 100),
-            "bar_e": int(alive_e / max(total_e, 1) * 100),
-            "cnt_f": f"{alive_f}/{total_f}",
-            "cnt_e": f"{alive_e}/{total_e}",
-        })
+        step    = max((s.get("step", 0) for s in states), default=0) if states else "-"
+        bar_f   = int(alive_f / max(total_f, 1) * 100)
+        bar_e   = int(alive_e / max(total_e, 1) * 100)
+        return f"""
+<div class='status-box'>
+  <div class='status-title'>📡 전투 현황 (스텝: {step})</div>
+  <table class='status-tbl'>
+    <tr>
+      <td class='blue-text'>🔵 아군</td>
+      <td><div class='bar-wrap'><div class='bar-fill blue-bar' style='width:{bar_f}%'></div></div></td>
+      <td class='cnt blue-text'>{alive_f}/{total_f}</td>
+    </tr>
+    <tr>
+      <td class='red-text'>🔴 적군</td>
+      <td><div class='bar-wrap'><div class='bar-fill red-bar' style='width:{bar_e}%'></div></div></td>
+      <td class='cnt red-text'>{alive_e}/{total_e}</td>
+    </tr>
+  </table>
+</div>"""
 
     # ------------------------------------------------------------------
-    # 이벤트 로그: 정적 골격 (최초 1회) + 행 HTML (타이머마다 갱신)
+    # 이벤트 로그 HTML (타이머마다 gr.HTML 직접 교체)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _make_event_skeleton() -> str:
-        return """
+    def _make_event_html(self) -> str:
+        """이벤트 로그 전체 HTML 생성."""
+        rows = self._make_event_rows()
+        return f"""
 <div class='event-wrapper'>
   <div class='event-header'>🚨 이벤트 로그</div>
   <div class='event-scroll' id='ev-scroll'>
@@ -549,9 +531,7 @@ class TacticalDashboard:
           <th>LLM 결정</th><th>처리</th>
         </tr>
       </thead>
-      <tbody id='ev-tbody'>
-        <tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>
-      </tbody>
+      <tbody>{rows}</tbody>
     </table>
   </div>
 </div>"""
@@ -608,27 +588,16 @@ class TacticalDashboard:
         return rows_html
 
     # ------------------------------------------------------------------
-    # 데이터 페이로드: status + events 를 단일 JSON으로 묶어 반환
-    # gr.HTML 캐리어에 실어 MutationObserver로 감지
-    # ------------------------------------------------------------------
-
-    def _make_data_payload(self) -> str:
-        import html as _html
-        payload = json.dumps({
-            "status": json.loads(self._make_status_data()),
-            "events": self._make_event_rows(),
-        })
-        # JSON 내 HTML 특수문자를 escape → textContent로 안전하게 읽기
-        return f'<div id="dyn-payload">{_html.escape(payload)}</div>'
-
-    # ------------------------------------------------------------------
-    # 통합 갱신 콜백
+    # 통합 갱신 콜백 — timer.tick 출력 3개: 지도 / 상태 / 이벤트
+    # visible=False data-carrier + MutationObserver 방식 폐기:
+    #   Gradio가 hidden 컴포넌트에 업데이트를 전달하지 않아 영구 dead state 발생
     # ------------------------------------------------------------------
 
     def _refresh(self):
         return (
             self._make_map_figure(),
-            self._make_data_payload(),  # hidden gr.HTML → MutationObserver → JS DOM update
+            self._make_status_html(),
+            self._make_event_html(),
         )
 
     # ------------------------------------------------------------------
@@ -711,88 +680,50 @@ class TacticalDashboard:
 
         init_js = """
 () => {
-  /* ── 이벤트 로그 스크롤 초기값 ── */
+  /* ── 이벤트 로그 스크롤 보존 ──────────────────────────────────────
+   * gr.Timer 가 event-log(gr.HTML)를 통째로 교체할 때마다
+   * MutationObserver 가 감지 → 스크롤 위치 복원
+   */
   if (sessionStorage.getItem('evAtBottom') === null) {
     sessionStorage.setItem('evAtBottom', '1');
   }
 
-  /*
-   * ── 지도 줌/패닝 보존 ──
-   * go.Scattergeo + uirevision="map" 조합으로 Plotly.react() 시
-   * 사용자의 줌/패닝이 자동으로 보존된다.
-   * (Mapbox GL 전용 jumpTo 코드 불필요 — 완전 오프라인 동작)
-   */
-
-  /* ── 상태·이벤트 in-place 업데이트 (깜빡임 없음) ──────────────────
-   * gr.Timer → data_carrier(gr.HTML, hidden) innerHTML 갱신
-   * → MutationObserver 감지 → 보이는 DOM 노드만 직접 수정
-   */
-
-  // 이벤트 스크롤 리스너 최초 1회 등록
-  var _evScrollBound = false;
-  function _bindEvScroll() {
-    if (_evScrollBound) return;
+  function _restoreScroll() {
     var el = document.getElementById('ev-scroll');
     if (!el) return;
-    _evScrollBound = true;
-    el.addEventListener('scroll', function() {
-      sessionStorage.setItem('evScroll', el.scrollTop);
-      var atBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-      sessionStorage.setItem('evAtBottom', atBot ? '1' : '0');
-    }, {passive: true});
+    /* 스크롤 이벤트 리스너 (최초 1회) */
+    if (!el._scrollBound) {
+      el._scrollBound = true;
+      el.addEventListener('scroll', function() {
+        sessionStorage.setItem('evScroll', el.scrollTop);
+        var atBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        sessionStorage.setItem('evAtBottom', atBot ? '1' : '0');
+      }, {passive: true});
+    }
+    /* 위치 복원 */
+    var atBot = sessionStorage.getItem('evAtBottom') !== '0';
+    if (atBot) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      var s = sessionStorage.getItem('evScroll');
+      if (s !== null) el.scrollTop = parseInt(s, 10);
+    }
   }
 
-  function _applyPayload() {
-    var el = document.getElementById('dyn-payload');
-    if (!el) return;
-    try {
-      var data = JSON.parse(el.textContent);
-
-      /* 상태 업데이트 */
-      var s = data.status || {};
-      var stepEl = document.getElementById('s-step');
-      var barF   = document.getElementById('s-bar-f');
-      var barE   = document.getElementById('s-bar-e');
-      var cntF   = document.getElementById('s-cnt-f');
-      var cntE   = document.getElementById('s-cnt-e');
-      if (stepEl) stepEl.textContent = s.step !== undefined ? s.step : '-';
-      if (barF)   barF.style.width   = (s.bar_f || 0) + '%';
-      if (barE)   barE.style.width   = (s.bar_e || 0) + '%';
-      if (cntF)   cntF.textContent   = s.cnt_f || '-/-';
-      if (cntE)   cntE.textContent   = s.cnt_e || '-/-';
-
-      /* 이벤트 로그 업데이트 */
-      var tbody = document.getElementById('ev-tbody');
-      if (tbody && data.events !== undefined) {
-        tbody.innerHTML = data.events;
-        _bindEvScroll();
-        var scroll = document.getElementById('ev-scroll');
-        if (scroll) {
-          var atBot = sessionStorage.getItem('evAtBottom') !== '0';
-          if (atBot) scroll.scrollTop = scroll.scrollHeight;
-          else {
-            var saved = sessionStorage.getItem('evScroll');
-            if (saved !== null) scroll.scrollTop = parseInt(saved, 10);
-          }
-        }
-      }
-    } catch(e) {}
-  }
-
-  /* data-carrier(gr.HTML)가 DOM에 나타나면 MutationObserver 연결 */
-  function _setupCarrier() {
-    var wrapper = document.getElementById('data-carrier');
+  /* event-log(gr.HTML) 컴포넌트가 DOM에 나타나면 Observer 등록 */
+  function _setupEventObserver() {
+    var wrapper = document.getElementById('event-log');
     if (!wrapper) return false;
-    new MutationObserver(_applyPayload).observe(
-      wrapper, {childList: true, subtree: true, characterData: true}
+    new MutationObserver(_restoreScroll).observe(
+      wrapper, {childList: true, subtree: true}
     );
+    _restoreScroll();
     return true;
   }
 
-  /* data-carrier가 아직 DOM에 없으면 주기적으로 재시도 */
-  if (!_setupCarrier()) {
-    var _cChk = setInterval(function() {
-      if (_setupCarrier()) clearInterval(_cChk);
+  if (!_setupEventObserver()) {
+    var _chk = setInterval(function() {
+      if (_setupEventObserver()) clearInterval(_chk);
     }, 200);
   }
 }
@@ -816,7 +747,7 @@ class TacticalDashboard:
 
             # ── 메인 행: 지도 + 우측 패널 ─────────────────────────────
             with gr.Row(equal_height=True):
-                # 지도 — 초기값 설정으로 로드 즉시 표시
+                # 지도
                 with gr.Column(scale=4, min_width=580):
                     map_plot = gr.Plot(
                         value=self._make_map_figure(),
@@ -824,11 +755,11 @@ class TacticalDashboard:
                         show_label=False,
                     )
 
-                # 우측 패널: 상태 요약(정적 골격) + 범례
+                # 우측 패널: 상태 요약(타이머가 직접 교체) + 범례
                 with gr.Column(scale=1, min_width=220):
-                    # 정적 골격 — 타이머가 교체하지 않음, JS가 내부 노드만 갱신
-                    gr.HTML(
-                        value=self._make_status_skeleton(),
+                    # gr.HTML 직접 갱신 — visible=False data-carrier 방식 폐기
+                    status_display = gr.HTML(
+                        value=self._make_status_html(),
                         elem_id="status-panel",
                     )
 
@@ -847,31 +778,24 @@ class TacticalDashboard:
   </table>
   <hr style='border-color:#45475a;margin:6px 0'>
   <b>비행 단계</b><br>
-  접근 · 교전 · RTB · 재장착
+  접근▲ · 교전▲ · RTB▽ · 재장착● · 완료✕
 </div>
 """,
                         elem_classes=["legend-md"],
                     )
 
-            # ── 이벤트 로그 (정적 골격) ───────────────────────────────
-            # 타이머가 교체하지 않음, JS가 ev-tbody.innerHTML만 교체
-            gr.HTML(
-                value=self._make_event_skeleton(),
+            # ── 이벤트 로그 (타이머가 직접 교체) ─────────────────────
+            event_display = gr.HTML(
+                value=self._make_event_html(),
                 elem_id="event-log",
             )
 
-            # ── 숨겨진 데이터 캐리어 (타이머 출력 대상) ──────────────
-            # visible=False: DOM에 존재하지만 display:none
-            # Gradio가 innerHTML 갱신 → MutationObserver 감지 → JS DOM 업데이트
-            data_carrier = gr.HTML(
-                value="", elem_id="data-carrier", visible=False,
-            )
-
             # ── 자동 갱신 (gr.Timer) ───────────────────────────────────
+            # 출력 3개: 지도 / 상태 박스 / 이벤트 로그
             timer = gr.Timer(value=self.refresh_interval)
             timer.tick(
                 fn=self._refresh,
-                outputs=[map_plot, data_carrier],
+                outputs=[map_plot, status_display, event_display],
             )
 
         return demo
