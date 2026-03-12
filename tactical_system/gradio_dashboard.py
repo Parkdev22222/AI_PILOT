@@ -517,10 +517,10 @@ class TacticalDashboard:
   <div class='ac-status-scroll'>
     <table class='ac-status-tbl'>
       <thead>
-        <tr><th>UID</th><th>팀</th><th>상태</th><th>기지</th></tr>
+        <tr><th>UID</th><th>팀</th><th>상태</th><th>기지</th><th>미사일</th></tr>
       </thead>
       <tbody id='ac-tbody'>
-        <tr><td colspan='4' class='no-event'>대기 중...</td></tr>
+        <tr><td colspan='5' class='no-event'>대기 중...</td></tr>
       </tbody>
     </table>
   </div>
@@ -531,7 +531,7 @@ class TacticalDashboard:
         import html as _html
         states = self._states()
         if not states:
-            return "<tr><td colspan='4' class='no-event'>데이터 없음</td></tr>"
+            return "<tr><td colspan='5' class='no-event'>데이터 없음</td></tr>"
 
         rows_html = ""
         for s in sorted(states, key=lambda x: (x["team"] != "friendly", x["aircraft_uid"])):
@@ -555,12 +555,14 @@ class TacticalDashboard:
                 status_cls = "status-dead"
 
             base = _html.escape(s.get("base_name", "-"))
+            missiles = s.get("missiles_left", 0) if s["is_alive"] else "-"
             rows_html += (
                 f"<tr>"
                 f"<td class='{team_cls}'>{uid}</td>"
                 f"<td class='{team_cls}'>{team_str}</td>"
                 f"<td class='{status_cls}'>{status_str}</td>"
                 f"<td>{base}</td>"
+                f"<td style='text-align:center'>{missiles}</td>"
                 f"</tr>\n"
             )
         return rows_html
