@@ -243,15 +243,7 @@ class TacticalDashboard:
         (124.5,39.5),(124.7,39.0),(124.6,38.5),(124.6,37.8),
     ]
 
-    # 한글 폰트 설정 (WenQuanYi = 한글 포함 CJK 폰트, 없으면 기본값 유지)
-    _KO_FONT: str = next(
-        (f.name for f in __import__("matplotlib").font_manager.fontManager.ttflist
-         if "WenQuanYi" in f.name),
-        "sans-serif",
-    )
-
     def _make_map_figure(self) -> plt.Figure:
-        plt.rcParams["font.family"] = self._KO_FONT
         states = self._states()
         zones  = self._detect_combat_zones(states)
 
@@ -268,7 +260,7 @@ class TacticalDashboard:
         # ── 휴전선 (38선 부근) ────────────────────────────────────────
         ax.axhline(38.3, color="#f38ba8", linewidth=0.8,
                    linestyle="--", alpha=0.6, zorder=3)
-        ax.text(124.2, 38.4, "휴전선", color="#f38ba8", fontsize=7, alpha=0.8)
+        ax.text(124.2, 38.4, "DMZ", color="#f38ba8", fontsize=7, alpha=0.8)
 
         # ── 교전 구역 ────────────────────────────────────────────────
         for zone in zones:
@@ -279,20 +271,20 @@ class TacticalDashboard:
             ax.plot(lons, lats, color="#ff5050", linewidth=1.5, zorder=4)
 
         # ── 기지 ─────────────────────────────────────────────────────
-        for name, info in FRIENDLY_BASES.items():
+        for i, (name, info) in enumerate(FRIENDLY_BASES.items()):
             ax.plot(info["lon"], info["lat"], "s",
                     color="#1a6fd4", markersize=11,
                     markeredgecolor="#89b4fa", markeredgewidth=1.5, zorder=6)
             ax.text(info["lon"] + 0.05, info["lat"] + 0.05,
-                    f"[F]{name}", color="#89b4fa", fontsize=7.5,
+                    f"F-Base{i+1}", color="#89b4fa", fontsize=7.5,
                     fontweight="bold", zorder=7)
 
-        for name, info in ENEMY_BASES.items():
+        for i, (name, info) in enumerate(ENEMY_BASES.items()):
             ax.plot(info["lon"], info["lat"], "s",
                     color="#c0392b", markersize=11,
                     markeredgecolor="#f38ba8", markeredgewidth=1.5, zorder=6)
             ax.text(info["lon"] + 0.05, info["lat"] + 0.05,
-                    f"[E]{name}", color="#f38ba8", fontsize=7.5,
+                    f"E-Base{i+1}", color="#f38ba8", fontsize=7.5,
                     fontweight="bold", zorder=7)
 
         # ── 항공기 ───────────────────────────────────────────────────
@@ -322,8 +314,8 @@ class TacticalDashboard:
         # ── 축 꾸미기 ────────────────────────────────────────────────
         ax.set_xlim(124.0, 131.0)
         ax.set_ylim(34.5, 43.0)
-        ax.set_xlabel("경도 (°E)", color="#cdd6f4", fontsize=9)
-        ax.set_ylabel("위도 (°N)", color="#cdd6f4", fontsize=9)
+        ax.set_xlabel("Lon (E)", color="#cdd6f4", fontsize=9)
+        ax.set_ylabel("Lat (N)", color="#cdd6f4", fontsize=9)
         ax.tick_params(colors="#cdd6f4", labelsize=8)
         ax.grid(True, color="#45475a", linewidth=0.4, alpha=0.5, zorder=0)
         for spine in ax.spines.values():
@@ -332,17 +324,17 @@ class TacticalDashboard:
         # ── 범례 ─────────────────────────────────────────────────────
         legend_items = [
             Line2D([0],[0], marker="s", color="w", markerfacecolor="#1a6fd4",
-                   markersize=9, label="아군 기지", linestyle="None"),
+                   markersize=9, label="Friendly Base", linestyle="None"),
             Line2D([0],[0], marker="s", color="w", markerfacecolor="#c0392b",
-                   markersize=9, label="적군 기지", linestyle="None"),
+                   markersize=9, label="Enemy Base", linestyle="None"),
             Line2D([0],[0], marker="^", color="w", markerfacecolor="#00b4ff",
-                   markersize=9, label="아군 (생존)", linestyle="None"),
+                   markersize=9, label="Friendly (alive)", linestyle="None"),
             Line2D([0],[0], marker="x", color="#7fb8d4",
-                   markersize=9, label="아군 (손실)", linestyle="None"),
+                   markersize=9, label="Friendly (KIA)", linestyle="None"),
             Line2D([0],[0], marker="^", color="w", markerfacecolor="#ff3030",
-                   markersize=9, label="적군 (생존)", linestyle="None"),
+                   markersize=9, label="Enemy (alive)", linestyle="None"),
             Line2D([0],[0], marker="x", color="#d47f7f",
-                   markersize=9, label="적군 (손실)", linestyle="None"),
+                   markersize=9, label="Enemy (KIA)", linestyle="None"),
         ]
         legend = ax.legend(
             handles=legend_items, loc="upper right",
