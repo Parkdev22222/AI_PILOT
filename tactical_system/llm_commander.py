@@ -76,12 +76,18 @@ class LLMCommander:
         self.sim_id = sim_id
 
         logger.info(f"EXAONE-3.5 모델 로딩 중: {model_id}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # local_files_only=True: 패쇄망 환경에서 HuggingFace Hub 접근 시도 차단
+        # 모델은 ~/.cache/huggingface/ 에 사전 캐싱되어 있어야 함
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            local_files_only=True,
+        )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.bfloat16,
             device_map=device,
             trust_remote_code=True,
+            local_files_only=True,
         )
         self.model.eval()
         logger.info("모델 로딩 완료.")

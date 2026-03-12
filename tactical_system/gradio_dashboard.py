@@ -1,19 +1,19 @@
 """
 gradio_dashboard.py
 ===================
-전술 공중전 시뮬레이터 Gradio 대시보드 (2-탭 구성)
+전술 공중전 시뮬레이터 Gradio 대시보드
 
-탭 1 — 전술 지도
-  - 아군(파란색) / 적군(빨간색) 기체 실시간 위치 (Plotly Mapbox)
-  - 교전 중인 편대쌍 → 빨간 반투명 20km 원
-  - RTB / 재장착 / 지원 편대 등 비행 단계별 마커 스타일
+지도
+  - 아군(파란색) / 적군(빨간색) 기체 실시간 위치 (Plotly Scattergeo, 완전 오프라인)
+  - 비행 단계별 마커 심볼: 접근·교전=▲, RTB=▽, 재장착=●, 임무완료=✕
+  - 교전 구역 → 빨간 반투명 20km 원
   - 이벤트 로그 테이블
 
-탭 2 — 전투 현황
-  - 기체별 상태 수치 테이블 (고도/속도/미사일/단계)
-  - LLM(EXAONE-3.5) 판단 이력 테이블
+전투 현황
+  - 생존율 막대 (아군/적군)
+  - LLM(EXAONE-3.5) 판단 이력
 
-DB 폴링 방식: demo.load(every=N) — Gradio 3.40+ 호환
+DB 폴링 방식: gr.Timer(every=N) — 완전 로컬 SQLite, 외부 네트워크 불필요
 """
 
 import json
@@ -112,14 +112,10 @@ class TacticalDashboard:
         db_path: str = "combat_simulation.db",
         sim_id: int = 1,
         refresh_interval: float = 2.0,
-        map_center: Tuple[float, float] = (127.0, 38.0),
-        map_zoom: int = 5,
     ):
         self.db = CombatDB(db_path)
         self.sim_id = sim_id
         self.refresh_interval = refresh_interval
-        self.map_center = map_center
-        self.map_zoom = map_zoom
 
     # ------------------------------------------------------------------
     # 데이터 조회
@@ -305,18 +301,27 @@ class TacticalDashboard:
             )
 
         # ── Trace 3·4·5·6: 항공기 (빈 배열이어도 항상 4개 trace 유지) ──
-        # go.Scattergeo: triangle-up / x 등 마커 심볼 완전 지원 (오프라인 OK)
-        for group, color, symbol, label, sz in [
-            (alive_f, "#00b4ff", "triangle-up", "아군 (생존)", 14),
-            (dead_f,  "#7fb8d4", "x",           "아군 (손실)",  9),
-            (alive_e, "#ff3030", "triangle-up", "적군 (생존)", 14),
-            (dead_e,  "#d47f7f", "x",           "적군 (손실)",  9),
+        # go.Scattergeo: symbol 배열 지원 → 비행 단계별 심볼 적용 (오프라인 OK)
+        # 생존 기체: _PHASE_SYMBOL 딕셔너리로 단계별 심볼 차등 표시
+        # 손실 기체: 고정 "x" 심볼
+        for group, color, label, sz, use_phase_symbol in [
+            (alive_f, "#00b4ff", "아군 (생존)", 14, True),
+            (dead_f,  "#7fb8d4", "아군 (손실)",  9, False),
+            (alive_e, "#ff3030", "적군 (생존)", 14, True),
+            (dead_e,  "#d47f7f", "적군 (손실)",  9, False),
         ]:
+            if use_phase_symbol:
+                symbols = [
+                    _PHASE_SYMBOL.get(s.get("flight_phase", "unknown"), "circle")
+                    for s in group
+                ]
+            else:
+                symbols = "x"
             fig.add_trace(go.Scattergeo(
                 lon=[s["lon"] for s in group],
                 lat=[s["lat"] for s in group],
                 mode="markers",
-                marker=dict(size=sz, color=color, symbol=symbol),
+                marker=dict(size=sz, color=color, symbol=symbols),
                 name=label,
                 hovertext=[_hover(s) for s in group],
                 hoverinfo="text" if group else "skip",
@@ -553,6 +558,7 @@ class TacticalDashboard:
 
     def _make_event_rows(self) -> str:
         """<tbody> 내부 <tr> 행들만 반환 — JS가 ev-tbody.innerHTML에 삽입."""
+        import html as _html
         events = self._events()
         if not events:
             return "<tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>"
@@ -566,22 +572,22 @@ class TacticalDashboard:
             if isinstance(details, dict):
                 if "loss_ratio" in details:
                     detail_str = (
-                        f"생존 {details.get('alive_friendly','?')}/"
-                        f"{details.get('total_friendly','?')}대 "
+                        f"생존 {_html.escape(str(details.get('alive_friendly','?')))}/"
+                        f"{_html.escape(str(details.get('total_friendly','?')))}대 "
                         f"({details['loss_ratio']*100:.0f}% 손실)"
                     )
                 elif "aircraft_uid" in details:
-                    detail_str = f"{details['aircraft_uid']} 무장 고갈"
+                    detail_str = f"{_html.escape(str(details['aircraft_uid']))} 무장 고갈"
                 else:
-                    detail_str = str(details)[:60]
+                    detail_str = _html.escape(str(details)[:60])
             else:
-                detail_str = str(details)[:60]
+                detail_str = _html.escape(str(details)[:60])
 
             action_ko = {
                 "rtb":             "전체 RTB",
                 "request_support": "지원 요청",
                 "continue":        "임무 지속",
-            }.get(dec.get("action", ""), dec.get("action", "-") if dec else "-")
+            }.get(dec.get("action", ""), _html.escape(dec.get("action", "-")) if dec else "-")
 
             resolved_badge = (
                 "<span class='badge-ok'>완료</span>"
@@ -593,7 +599,7 @@ class TacticalDashboard:
             rows_html += (
                 f"<tr>"
                 f"<td>{e.get('step','-')}</td>"
-                f"<td class='{type_class}'>{etype}</td>"
+                f"<td class='{type_class}'>{_html.escape(etype)}</td>"
                 f"<td>{detail_str}</td>"
                 f"<td>{action_ko}</td>"
                 f"<td>{resolved_badge}</td>"
