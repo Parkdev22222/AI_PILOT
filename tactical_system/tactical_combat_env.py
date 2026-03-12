@@ -343,6 +343,9 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         # 지원 편대 스폰 추적
         self._support_spawned: Dict[int, bool] = {i: False for i in range(len(formation_pairs))}
 
+        # 임무완료 편대 재배정 추적 (set of pair_idx)
+        self._victory_reassigned: set = set()
+
     # ------------------------------------------------------------------
     # 정책 로드
     # ------------------------------------------------------------------
@@ -381,6 +384,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_ammo_depleted = False
         self.event_ammo_depleted_ids.clear()
         self.event_formation_ammo_depleted.clear()
+        self._victory_reassigned.clear()
         self.reload_pending.clear()
         self.reloaded_returning.clear()
         self.pair_phases = {i: "approach" for i in range(len(self.formation_pairs))}
@@ -404,6 +408,11 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         -------
         info dict (dones, rewards, events, …)
         """
+        # ── 임무완료 편대 재배정 (safe_return done=True 방지) ───────────
+        # self.step() 내부 get_termination() 이 enemies 를 검사하기 전에
+        # 새 적기를 enemies 에 추가해야 done=True 를 막을 수 있음
+        self._reassign_victorious_formations()
+
         # ── 행동 계산 ──────────────────────────────────────────────────
         actions = self._compute_actions()
 
@@ -1050,6 +1059,97 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             if uid in pair["friendly_uids"]:
                 return i
         return None
+
+    # ------------------------------------------------------------------
+    # 임무완료 편대 재배정 (safe_return done=True 방지)
+    # ------------------------------------------------------------------
+
+    def _reassign_victorious_formations(self):
+        """
+        담당 적 편대를 전멸시킨 아군 편대를 아직 교전 중인 다른 적 편대로 재배정.
+
+        self.step() 호출 전에 실행하여 safe_return.get_termination()이
+        enemies 리스트를 검사하기 전에 enemies를 갱신함으로써 done=True 방지.
+
+        동작:
+          1. pair i 의 enemy_uids 가 전부 사망 → '임무완료' 편대로 판단
+          2. 다른 pair j 에 생존 적기가 있으면:
+             - pair i 아군 기체의 enemies 에 pair j 생존 적기 추가
+             - pair j 적기의 enemies 에 pair i 생존 아군 기체 추가
+             - pair i 의 enemy_uids 목록에 pair j 의 enemy_uids 병합
+          3. pair i 를 _victory_reassigned 에 기록 → 중복 처리 방지
+        """
+        for i, pair in enumerate(self.formation_pairs):
+            if i in self._victory_reassigned:
+                continue
+            if self.pair_phases.get(i) in ("rtb_loss", "rtb_ammo", "done"):
+                continue
+
+            # pair i 의 담당 적기 중 생존자 확인
+            alive_enemy_in_pair = [
+                u for u in pair["enemy_uids"]
+                if u in self.agents and self.agents[u].is_alive
+            ]
+            if alive_enemy_in_pair:
+                continue  # 아직 교전 중 → 재배정 불필요
+
+            # pair i 아군 생존 기체
+            alive_friendly = [
+                u for u in pair["friendly_uids"]
+                if u in self.agents and self.agents[u].is_alive
+            ]
+            if not alive_friendly:
+                continue  # 아군도 없음
+
+            # 생존 적기가 가장 많은 다른 pair 선택
+            target_idx, target_enemy_sims = self._find_best_target_pair(i)
+            if target_idx is None:
+                continue  # 모든 적 전멸 → 진짜 임무 완료, done 허용
+
+            # ── 아군 기체 enemies 갱신 ────────────────────────────────
+            for fu in alive_friendly:
+                f_sim = self.agents[fu]
+                for e_sim in target_enemy_sims:
+                    if e_sim not in f_sim.enemies:
+                        f_sim.enemies.append(e_sim)
+
+            # ── 적기 enemies 에 아군 추가 ─────────────────────────────
+            friendly_sims = [self.agents[fu] for fu in alive_friendly]
+            for e_sim in target_enemy_sims:
+                for f_sim in friendly_sims:
+                    if f_sim not in e_sim.enemies:
+                        e_sim.enemies.append(f_sim)
+
+            # ── pair enemy_uids 병합 (DB 추적용) ─────────────────────
+            target_pair = self.formation_pairs[target_idx]
+            for eu in target_pair["enemy_uids"]:
+                if eu not in pair["enemy_uids"]:
+                    pair["enemy_uids"].append(eu)
+
+            self._victory_reassigned.add(i)
+            logger.info(
+                f"[재배정] 편대{i}({pair['friendly_base']['name']}) "
+                f"담당 적 전멸 → 편대{target_idx} 지원 "
+                f"(적기 {len(target_enemy_sims)}대, "
+                f"아군 {len(alive_friendly)}대 추가)"
+            )
+
+    def _find_best_target_pair(self, exclude_idx: int) -> Tuple[Optional[int], List]:
+        """생존 적기 수가 가장 많은 다른 pair 반환."""
+        best_idx = None
+        best_sims: List = []
+        for j, pair in enumerate(self.formation_pairs):
+            if j == exclude_idx:
+                continue
+            alive = [
+                self.agents[eu]
+                for eu in pair["enemy_uids"]
+                if eu in self.agents and self.agents[eu].is_alive
+            ]
+            if alive and len(alive) > len(best_sims):
+                best_idx = j
+                best_sims = alive
+        return best_idx, best_sims
 
     # ------------------------------------------------------------------
     # DB formation_id 등록 (컨트롤러에서 호출)
