@@ -22,10 +22,13 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import gradio as gr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.io as pio
 
 from .combat_db import CombatDB
 from .llm_commander import ENEMY_BASES, FRIENDLY_BASES
@@ -37,16 +40,16 @@ _ALL_BASES = {
     **{k: {**v, "team": "friendly"} for k, v in FRIENDLY_BASES.items()},
 }
 
-# 비행 단계 → 마커 모양
-_PHASE_SYMBOL = {
-    "approach":  "triangle-up",
-    "combat":    "triangle-up",
-    "rtb_loss":  "triangle-down",
-    "reload":    "circle",
-    "returning": "triangle-up",
-    "support":   "triangle-up",
+# 비행 단계 → matplotlib 마커
+_PHASE_MARKER = {
+    "approach":  "^",
+    "combat":    "^",
+    "rtb_loss":  "v",
+    "reload":    "o",
+    "returning": "^",
+    "support":   "^",
     "done":      "x",
-    "unknown":   "circle",
+    "unknown":   "o",
 }
 
 # 비행 단계 한글 이름
@@ -218,148 +221,134 @@ class TacticalDashboard:
                  "radius_km": 20.0, "label": "교전구역"}]
 
     # ------------------------------------------------------------------
-    # 탭 1: 지도 생성
+    # 탭 1: 지도 생성 (matplotlib — JS/Plotly 버전 충돌 없이 PNG로 렌더링)
     # ------------------------------------------------------------------
 
-    def _make_map_figure(self) -> go.Figure:
+    # 한반도 간략 윤곽선 (경위도)
+    _PENINSULA = [
+        # 남한 서해안
+        (124.6,37.8),(125.1,37.7),(126.1,37.2),(126.3,36.6),
+        (126.5,36.0),(126.3,35.5),(126.5,35.0),(127.0,34.5),
+        # 남한 남해안·동해안
+        (127.5,34.5),(128.5,34.8),(129.0,35.1),(129.3,36.0),
+        (129.4,37.0),(129.5,38.0),
+        # 휴전선 ~ 북한 동해안
+        (129.6,38.6),(130.5,40.0),(130.6,41.5),(130.5,42.5),
+        # 북한 북쪽 국경
+        (129.0,42.5),(128.0,42.0),(126.5,42.0),(125.5,41.8),
+        (124.5,40.5),(124.3,40.0),
+        # 북한 서해안 → 시작점으로
+        (124.5,39.5),(124.7,39.0),(124.6,38.5),(124.6,37.8),
+    ]
+
+    # 한글 폰트 설정 (WenQuanYi = 한글 포함 CJK 폰트, 없으면 기본값 유지)
+    _KO_FONT: str = next(
+        (f.name for f in __import__("matplotlib").font_manager.fontManager.ttflist
+         if "WenQuanYi" in f.name),
+        "sans-serif",
+    )
+
+    def _make_map_figure(self) -> plt.Figure:
+        plt.rcParams["font.family"] = self._KO_FONT
         states = self._states()
         zones  = self._detect_combat_zones(states)
 
-        fig = go.Figure()
+        fig, ax = plt.subplots(figsize=(9, 8))
+        fig.patch.set_facecolor("#1e1e2e")
+        ax.set_facecolor("#1a1a2e")
 
-        # ── Trace 0: 교전 구역 (항상 단일 trace, None 구분자로 여러 원 연결) ──
-        # go.Scattergeo는 오프라인 동작 (Plotly 내장 지리 데이터 사용)
-        zone_lons: List[Optional[float]] = []
-        zone_lats: List[Optional[float]] = []
+        # ── 한반도 윤곽 ──────────────────────────────────────────────
+        px = [p[0] for p in self._PENINSULA]
+        py = [p[1] for p in self._PENINSULA]
+        ax.fill(px, py, color="#2d2d44", zorder=1)
+        ax.plot(px, py, color="#6272a4", linewidth=0.8, zorder=2)
+
+        # ── 휴전선 (38선 부근) ────────────────────────────────────────
+        ax.axhline(38.3, color="#f38ba8", linewidth=0.8,
+                   linestyle="--", alpha=0.6, zorder=3)
+        ax.text(124.2, 38.4, "휴전선", color="#f38ba8", fontsize=7, alpha=0.8)
+
+        # ── 교전 구역 ────────────────────────────────────────────────
         for zone in zones:
             lons, lats = _circle_coords(
                 zone["center_lon"], zone["center_lat"], zone["radius_km"]
             )
-            if zone_lons:
-                zone_lons.append(None)
-                zone_lats.append(None)
-            zone_lons.extend(lons)
-            zone_lats.extend(lats)
-        fig.add_trace(go.Scattergeo(
-            lon=zone_lons, lat=zone_lats,
-            mode="lines",
-            line=dict(color="rgba(255,80,80,0.9)", width=2),
-            fill="toself",
-            fillcolor="rgba(255,0,0,0.15)",
-            name="교전구역",
-            hoverinfo="skip",
-            showlegend=bool(zones),
-        ))
+            ax.fill(lons, lats, color="red", alpha=0.15, zorder=4)
+            ax.plot(lons, lats, color="#ff5050", linewidth=1.5, zorder=4)
 
-        # ── Trace 1: 아군 기지 (항상 고정) ───────────────────────────
-        fb = list(FRIENDLY_BASES.items())
-        fig.add_trace(go.Scattergeo(
-            lon=[v["lon"] for _, v in fb],
-            lat=[v["lat"] for _, v in fb],
-            mode="markers+text",
-            marker=dict(size=14, color="#1a6fd4", symbol="square",
-                        line=dict(color="#89b4fa", width=2)),
-            text=["✈ " + n for n, _ in fb],
-            textposition="top right",
-            textfont=dict(size=10, color="#89b4fa"),
-            name="아군 기지",
-            hovertext=[f"아군 기지: {n}" for n, _ in fb],
-            hoverinfo="text",
-            showlegend=True,
-        ))
+        # ── 기지 ─────────────────────────────────────────────────────
+        for name, info in FRIENDLY_BASES.items():
+            ax.plot(info["lon"], info["lat"], "s",
+                    color="#1a6fd4", markersize=11,
+                    markeredgecolor="#89b4fa", markeredgewidth=1.5, zorder=6)
+            ax.text(info["lon"] + 0.05, info["lat"] + 0.05,
+                    f"✈{name}", color="#89b4fa", fontsize=7.5,
+                    fontweight="bold", zorder=7)
 
-        # ── Trace 2: 적군 기지 (항상 고정) ───────────────────────────
-        eb = list(ENEMY_BASES.items())
-        fig.add_trace(go.Scattergeo(
-            lon=[v["lon"] for _, v in eb],
-            lat=[v["lat"] for _, v in eb],
-            mode="markers+text",
-            marker=dict(size=14, color="#c0392b", symbol="square",
-                        line=dict(color="#f38ba8", width=2)),
-            text=["✈ " + n for n, _ in eb],
-            textposition="top right",
-            textfont=dict(size=10, color="#f38ba8"),
-            name="적군 기지",
-            hovertext=[f"적군 기지: {n}" for n, _ in eb],
-            hoverinfo="text",
-            showlegend=True,
-        ))
+        for name, info in ENEMY_BASES.items():
+            ax.plot(info["lon"], info["lat"], "s",
+                    color="#c0392b", markersize=11,
+                    markeredgecolor="#f38ba8", markeredgewidth=1.5, zorder=6)
+            ax.text(info["lon"] + 0.05, info["lat"] + 0.05,
+                    f"✈{name}", color="#f38ba8", fontsize=7.5,
+                    fontweight="bold", zorder=7)
 
-        # 항공기 분류
-        alive_f = [s for s in states if s["team"] == "friendly" and     s["is_alive"]]
-        dead_f  = [s for s in states if s["team"] == "friendly" and not s["is_alive"]]
-        alive_e = [s for s in states if s["team"] == "enemy"    and     s["is_alive"]]
-        dead_e  = [s for s in states if s["team"] == "enemy"    and not s["is_alive"]]
-
-        def _hover(s: Dict) -> str:
-            return (
-                f"<b>{s['aircraft_uid']}</b><br>"
-                f"팀: {'아군' if s['team']=='friendly' else '적군'}<br>"
-                f"고도: {s.get('alt',0):.0f}m<br>"
-                f"속도: {s.get('speed_mps',0):.0f}m/s<br>"
-                f"미사일: {s.get('missiles_left',0)}발<br>"
-                f"단계: {_PHASE_KO.get(s.get('flight_phase','unknown'),'-')}<br>"
-                f"기지: {s.get('base_name','-')}"
-            )
-
-        # ── Trace 3·4·5·6: 항공기 (빈 배열이어도 항상 4개 trace 유지) ──
-        # go.Scattergeo: symbol 배열 지원 → 비행 단계별 심볼 적용 (오프라인 OK)
-        # 생존 기체: _PHASE_SYMBOL 딕셔너리로 단계별 심볼 차등 표시
-        # 손실 기체: 고정 "x" 심볼
-        for group, color, label, sz, use_phase_symbol in [
-            (alive_f, "#00b4ff", "아군 (생존)", 14, True),
-            (dead_f,  "#7fb8d4", "아군 (손실)",  9, False),
-            (alive_e, "#ff3030", "적군 (생존)", 14, True),
-            (dead_e,  "#d47f7f", "적군 (손실)",  9, False),
-        ]:
-            if use_phase_symbol:
-                symbols = [
-                    _PHASE_SYMBOL.get(s.get("flight_phase", "unknown"), "circle")
-                    for s in group
-                ]
+        # ── 항공기 ───────────────────────────────────────────────────
+        for s in states:
+            phase   = s.get("flight_phase", "unknown")
+            marker  = _PHASE_MARKER.get(phase, "o")
+            alive   = bool(s["is_alive"])
+            if s["team"] == "friendly":
+                color = "#00b4ff" if alive else "#7fb8d4"
             else:
-                symbols = "x"
-            fig.add_trace(go.Scattergeo(
-                lon=[s["lon"] for s in group],
-                lat=[s["lat"] for s in group],
-                mode="markers",
-                marker=dict(size=sz, color=color, symbol=symbols),
-                name=label,
-                hovertext=[_hover(s) for s in group],
-                hoverinfo="text" if group else "skip",
-                showlegend=True,
-            ))
+                color = "#ff3030" if alive else "#d47f7f"
+            msize = 10 if alive else 7
 
-        # ── 지도 레이아웃 (완전 오프라인, Plotly 내장 데이터) ──────────
-        # scope 없이 lonaxis/lataxis.range 로만 뷰 제어:
-        # scope="asia" + 좁은 range 조합이 일부 Plotly 버전에서 흰 화면 유발
-        fig.update_layout(
-            geo=dict(
-                projection_type="mercator",
-                showland=True,       landcolor="#2d2d44",
-                showocean=True,      oceancolor="#1a1a2e",
-                showcoastlines=True, coastlinecolor="#6272a4",
-                showcountries=True,  countrycolor="#6272a4",
-                showlakes=False,     showrivers=False,
-                bgcolor="#1e1e2e",
-                lonaxis=dict(range=[124.0, 131.0]),
-                lataxis=dict(range=[34.5, 43.0]),
-            ),
-            margin=dict(l=0, r=0, t=0, b=0),
-            paper_bgcolor="#1e1e2e",
-            plot_bgcolor="#1e1e2e",
-            font=dict(color="#cdd6f4"),
-            legend=dict(
-                bgcolor="rgba(30,30,46,0.8)",
-                bordercolor="#45475a",
-                borderwidth=1,
-                font=dict(color="#cdd6f4", size=11),
-                x=0.01, y=0.99,
-                xanchor="left", yanchor="top",
-            ),
-            height=650,
-            uirevision="map",  # 항상 동일 → Plotly.react() 시 줌/패닝 보존
+            if not alive:
+                marker = "x"
+
+            ax.plot(s["lon"], s["lat"], marker,
+                    color=color, markersize=msize,
+                    markeredgecolor="white" if alive else color,
+                    markeredgewidth=0.5, zorder=8)
+
+            # 기체 ID 레이블
+            ax.text(s["lon"] + 0.04, s["lat"] + 0.04,
+                    s["aircraft_uid"], color=color,
+                    fontsize=6.5, zorder=9)
+
+        # ── 축 꾸미기 ────────────────────────────────────────────────
+        ax.set_xlim(124.0, 131.0)
+        ax.set_ylim(34.5, 43.0)
+        ax.set_xlabel("경도 (°E)", color="#cdd6f4", fontsize=9)
+        ax.set_ylabel("위도 (°N)", color="#cdd6f4", fontsize=9)
+        ax.tick_params(colors="#cdd6f4", labelsize=8)
+        ax.grid(True, color="#45475a", linewidth=0.4, alpha=0.5, zorder=0)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#45475a")
+
+        # ── 범례 ─────────────────────────────────────────────────────
+        legend_items = [
+            Line2D([0],[0], marker="s", color="w", markerfacecolor="#1a6fd4",
+                   markersize=9, label="아군 기지", linestyle="None"),
+            Line2D([0],[0], marker="s", color="w", markerfacecolor="#c0392b",
+                   markersize=9, label="적군 기지", linestyle="None"),
+            Line2D([0],[0], marker="^", color="w", markerfacecolor="#00b4ff",
+                   markersize=9, label="아군 (생존)", linestyle="None"),
+            Line2D([0],[0], marker="x", color="#7fb8d4",
+                   markersize=9, label="아군 (손실)", linestyle="None"),
+            Line2D([0],[0], marker="^", color="w", markerfacecolor="#ff3030",
+                   markersize=9, label="적군 (생존)", linestyle="None"),
+            Line2D([0],[0], marker="x", color="#d47f7f",
+                   markersize=9, label="적군 (손실)", linestyle="None"),
+        ]
+        legend = ax.legend(
+            handles=legend_items, loc="upper right",
+            facecolor="#2d2d44", edgecolor="#45475a",
+            labelcolor="#cdd6f4", fontsize=8,
         )
+
+        fig.tight_layout(pad=0.5)
         return fig
 
     # ------------------------------------------------------------------
@@ -670,30 +659,13 @@ class TacticalDashboard:
         })
 
     # ------------------------------------------------------------------
-    # 지도 HTML 생성 — gr.HTML 컴포넌트용
-    # ------------------------------------------------------------------
-    # pio.to_html(include_plotlyjs=<local_url>) 로 완전한 HTML 을 매번 생성.
-    # Plotly.js 는 /file=<경로> 로 브라우저가 1회 내려받은 뒤 캐시 사용.
-    # ------------------------------------------------------------------
-
-    def _make_map_html(self) -> str:
-        fig = self._make_map_figure()
-        return pio.to_html(
-            fig,
-            include_plotlyjs=f"/file={self._plotly_js_path}",
-            full_html=False,
-            div_id="tactical-map",
-            config={"responsive": True, "displayModeBar": False},
-        )
-
-    # ------------------------------------------------------------------
-    # 통합 갱신 콜백 — timer.tick 출력 2개: 지도 HTML / data-carrier
+    # 통합 갱신 콜백 — timer.tick 출력 2개: 지도 / data-carrier
     # ------------------------------------------------------------------
 
     def _refresh(self):
         return (
-            self._make_map_html(),
-            self._make_data_payload(),  # CSS hidden gr.HTML → MutationObserver → in-place DOM
+            self._make_map_figure(),
+            self._make_data_payload(),
         )
 
     # ------------------------------------------------------------------
@@ -873,13 +845,6 @@ class TacticalDashboard:
             primary_hue=gr.themes.colors.blue,
             neutral_hue=gr.themes.colors.slate,
         )
-        # Plotly.js 로컬 경로 저장 — _make_map_html() 및 launch(allowed_paths) 에서 사용
-        import plotly as _plotly_pkg
-        _plotly_data_dir = os.path.join(
-            os.path.dirname(_plotly_pkg.__file__), "package_data"
-        )
-        self._plotly_js_path     = os.path.join(_plotly_data_dir, "plotly.min.js")
-        self._plotly_allowed_path = _plotly_data_dir
         ui_kwargs = {"theme": theme, "css": css, "js": init_js}
         _blocks_params = inspect.signature(gr.Blocks.__init__).parameters
         _launch_params = inspect.signature(gr.Blocks.launch).parameters
@@ -898,10 +863,12 @@ class TacticalDashboard:
 
             # ── 메인 행: 지도 + 우측 패널 ─────────────────────────────
             with gr.Row(equal_height=True):
-                # 지도 — gr.HTML + Plotly.js CDN (Gradio 번들 구버전 우회)
+                # 지도 — matplotlib PNG (Plotly.js 버전 충돌 없이 항상 렌더링)
                 with gr.Column(scale=4, min_width=580):
-                    map_plot = gr.HTML(
-                        value=self._make_map_html(),
+                    map_plot = gr.Plot(
+                        value=self._make_map_figure(),
+                        label="실시간 전투 지도",
+                        show_label=False,
                     )
 
                 # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
@@ -955,13 +922,10 @@ class TacticalDashboard:
 
     def launch(self, server_port: int = 7860, share: bool = False, **kwargs):
         demo = self.build()
-        # allowed_paths: Plotly.js 로컬 파일을 /file=<경로> URL 로 서빙하기 위해 필요
-        existing = list(kwargs.pop("allowed_paths", None) or [])
         demo.launch(
             server_name="0.0.0.0",
             server_port=server_port,
             share=share,
-            allowed_paths=existing + [self._plotly_allowed_path],
             **self._launch_ui,
             **kwargs,
         )
