@@ -910,8 +910,8 @@ class TacticalDashboard:
           font-size:0.9rem; height:100%;
         }
         .status-title { font-weight:700; margin-bottom:8px; color:#cba6f7; }
-        .status-tbl   { width:100%; border-collapse:collapse; }
-        .status-tbl td { padding:4px 6px; vertical-align:middle; }
+        .status-tbl   { width:100%; border-collapse:collapse; border:1px solid #ffffff; }
+        .status-tbl td { padding:4px 6px; vertical-align:middle; border:1px solid #ffffff; }
         .blue-text { color:#89b4fa; font-weight:600; white-space:nowrap; }
         .red-text  { color:#f38ba8; font-weight:600; white-space:nowrap; }
         .cnt { text-align:right; font-weight:700; white-space:nowrap; width:52px; }
@@ -924,8 +924,10 @@ class TacticalDashboard:
         .red-bar   { background:#f38ba8; }
 
         /* ── 범례 박스 ── */
-        .legend-md { background:#313244; border-radius:8px; padding:10px 14px; font-size:0.82rem; }
-        .legend-md table { font-size:0.82rem; }
+        .legend-md { background:#313244; border-radius:8px; padding:10px 14px; font-size:0.82rem; color:#ffffff; }
+        .legend-md table { font-size:0.82rem; color:#ffffff; }
+        .legend-md td { color:#ffffff; }
+        .legend-md b { color:#ffffff; }
 
         /* ── 기체 현황 패널 ── */
         .ac-status-wrapper { background:#313244; border-radius:8px; overflow:hidden; margin-top:8px; }
