@@ -24,6 +24,7 @@ import gradio as gr
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 
 from .combat_db import CombatDB
 from .llm_commander import ENEMY_BASES, FRIENDLY_BASES
@@ -668,12 +669,35 @@ class TacticalDashboard:
         })
 
     # ------------------------------------------------------------------
-    # 통합 갱신 콜백 — timer.tick 출력 2개: 지도 / data-carrier
+    # 지도 HTML 생성 — gr.HTML 컴포넌트용
+    # ------------------------------------------------------------------
+    # Gradio 6.x 가 번들하는 Plotly.js 는 구버전이라 Scattergeo 가 흰 화면이 됨.
+    # Plotly Python 6.x 는 Plotly.js 3.x 를 사용하므로, to_html() 로 직접 embed.
+    # include_plotlyjs='cdn' → 첫 로드 후 브라우저 캐시 → 이후 갱신은 ~7KB 만 전송.
+    # Plotly.react() 사용 → 동일 div 재활용 시 줌/패닝 상태 유지.
+    # ------------------------------------------------------------------
+
+    def _make_map_html(self) -> str:
+        fig = self._make_map_figure()
+        fig_json = fig.to_json()
+        return f"""<div id="tactical-map" style="height:650px;width:100%;background:#1e1e2e;"></div>
+<script>(function(){{
+  function render(){{
+    var el=document.getElementById('tactical-map');
+    if(!el||!window.Plotly){{setTimeout(render,100);return;}}
+    var fig={fig_json};
+    Plotly.react(el,fig.data,fig.layout,{{responsive:true,displayModeBar:false}});
+  }}
+  render();
+}})();</script>"""
+
+    # ------------------------------------------------------------------
+    # 통합 갱신 콜백 — timer.tick 출력 2개: 지도 HTML / data-carrier
     # ------------------------------------------------------------------
 
     def _refresh(self):
         return (
-            self._make_map_figure(),
+            self._make_map_html(),
             self._make_data_payload(),  # CSS hidden gr.HTML → MutationObserver → in-place DOM
         )
 
@@ -854,7 +878,11 @@ class TacticalDashboard:
             primary_hue=gr.themes.colors.blue,
             neutral_hue=gr.themes.colors.slate,
         )
-        ui_kwargs = {"theme": theme, "css": css, "js": init_js}
+        # Plotly.js 3.x CDN 로드 — Gradio 번들 버전(구버전)을 우회해 Scattergeo 정상 렌더링
+        plotly_cdn = (
+            '<script src="https://cdn.plot.ly/plotly-3.4.0.min.js"></script>'
+        )
+        ui_kwargs = {"theme": theme, "css": css, "js": init_js, "head": plotly_cdn}
         _blocks_params = inspect.signature(gr.Blocks.__init__).parameters
         _launch_params = inspect.signature(gr.Blocks.launch).parameters
 
@@ -872,12 +900,10 @@ class TacticalDashboard:
 
             # ── 메인 행: 지도 + 우측 패널 ─────────────────────────────
             with gr.Row(equal_height=True):
-                # 지도
+                # 지도 — gr.HTML + Plotly.js CDN (Gradio 번들 구버전 우회)
                 with gr.Column(scale=4, min_width=580):
-                    map_plot = gr.Plot(
-                        value=self._make_map_figure(),
-                        label="실시간 전투 지도",
-                        show_label=False,
+                    map_plot = gr.HTML(
+                        value=self._make_map_html(),
                     )
 
                 # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
