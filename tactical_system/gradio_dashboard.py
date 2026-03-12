@@ -16,6 +16,8 @@ gradio_dashboard.py
 DB 폴링 방식: gr.Timer(every=N) — 완전 로컬 SQLite, 외부 네트워크 불필요
 """
 
+import base64
+import io
 import json
 import math
 import os
@@ -282,7 +284,7 @@ class TacticalDashboard:
                     color="#1a6fd4", markersize=11,
                     markeredgecolor="#89b4fa", markeredgewidth=1.5, zorder=6)
             ax.text(info["lon"] + 0.05, info["lat"] + 0.05,
-                    f"✈{name}", color="#89b4fa", fontsize=7.5,
+                    f"[F]{name}", color="#89b4fa", fontsize=7.5,
                     fontweight="bold", zorder=7)
 
         for name, info in ENEMY_BASES.items():
@@ -290,7 +292,7 @@ class TacticalDashboard:
                     color="#c0392b", markersize=11,
                     markeredgecolor="#f38ba8", markeredgewidth=1.5, zorder=6)
             ax.text(info["lon"] + 0.05, info["lat"] + 0.05,
-                    f"✈{name}", color="#f38ba8", fontsize=7.5,
+                    f"[E]{name}", color="#f38ba8", fontsize=7.5,
                     fontweight="bold", zorder=7)
 
         # ── 항공기 ───────────────────────────────────────────────────
@@ -350,6 +352,21 @@ class TacticalDashboard:
 
         fig.tight_layout(pad=0.5)
         return fig
+
+    def _make_map_img_tag(self) -> str:
+        """matplotlib figure → base64 PNG → <img> HTML 태그.
+        gr.Plot 의 내부 인코딩(webp 등)을 완전히 우회해 항상 렌더링 보장."""
+        fig = self._make_map_figure()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor="#1e1e2e",
+                    bbox_inches="tight", dpi=110)
+        plt.close(fig)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode()
+        return (
+            f'<img src="data:image/png;base64,{b64}" '
+            f'style="width:100%;height:auto;display:block;" />'
+        )
 
     # ------------------------------------------------------------------
     # 탭 1: 이벤트 로그 테이블
@@ -664,7 +681,7 @@ class TacticalDashboard:
 
     def _refresh(self):
         return (
-            self._make_map_figure(),
+            self._make_map_img_tag(),
             self._make_data_payload(),
         )
 
@@ -863,13 +880,10 @@ class TacticalDashboard:
 
             # ── 메인 행: 지도 + 우측 패널 ─────────────────────────────
             with gr.Row(equal_height=True):
-                # 지도 — matplotlib PNG (Plotly.js 버전 충돌 없이 항상 렌더링)
+                # 지도 — matplotlib → base64 PNG → gr.HTML <img>
+                # gr.Plot 의 내부 webp 인코딩 우회, 항상 렌더링 보장
                 with gr.Column(scale=4, min_width=580):
-                    map_plot = gr.Plot(
-                        value=self._make_map_figure(),
-                        label="실시간 전투 지도",
-                        show_label=False,
-                    )
+                    map_plot = gr.HTML(value=self._make_map_img_tag())
 
                 # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
                 with gr.Column(scale=1, min_width=220):
