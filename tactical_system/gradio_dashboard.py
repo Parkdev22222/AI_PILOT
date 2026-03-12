@@ -728,15 +728,16 @@ class TacticalDashboard:
   }
 }
 """
-        with gr.Blocks(
-            title="한반도 전술 공중전 시뮬레이터",
-            theme=gr.themes.Base(
-                primary_hue=gr.themes.colors.blue,
-                neutral_hue=gr.themes.colors.slate,
-            ),
-            css=css,
-            js=init_js,
-        ) as demo:
+        # Gradio 6.0에서 theme/css/js 는 launch()에 전달 (Blocks에서 제거됨)
+        # launch() 호출 시 사용할 수 있도록 인스턴스에 저장
+        self._ui_theme = gr.themes.Base(
+            primary_hue=gr.themes.colors.blue,
+            neutral_hue=gr.themes.colors.slate,
+        )
+        self._ui_css = css
+        self._ui_js  = init_js
+
+        with gr.Blocks(title="한반도 전술 공중전 시뮬레이터") as demo:
 
             # ── 헤더 ──────────────────────────────────────────────────
             gr.Markdown(
@@ -806,5 +807,8 @@ class TacticalDashboard:
             server_name="0.0.0.0",
             server_port=server_port,
             share=share,
+            theme=self._ui_theme,
+            css=self._ui_css,
+            js=self._ui_js,
             **kwargs,
         )
