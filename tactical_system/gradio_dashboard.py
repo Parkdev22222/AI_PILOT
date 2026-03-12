@@ -18,6 +18,7 @@ DB 폴링 방식: gr.Timer(every=N) — 완전 로컬 SQLite, 외부 네트워�
 
 import json
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import gradio as gr
@@ -878,11 +879,17 @@ class TacticalDashboard:
             primary_hue=gr.themes.colors.blue,
             neutral_hue=gr.themes.colors.slate,
         )
-        # Plotly.js 3.x CDN 로드 — Gradio 번들 버전(구버전)을 우회해 Scattergeo 정상 렌더링
-        plotly_cdn = (
-            '<script src="https://cdn.plot.ly/plotly-3.4.0.min.js"></script>'
+        # Plotly.js 로컬 파일 서빙 — CDN 차단 환경 대응
+        # Gradio allowed_paths 로 plotly 패키지 디렉터리를 노출하고
+        # /file=<절대경로> URL 로 참조 → 브라우저가 1회 로드 후 캐시
+        import plotly as _plotly_pkg
+        _plotly_data_dir = os.path.join(
+            os.path.dirname(_plotly_pkg.__file__), "package_data"
         )
-        ui_kwargs = {"theme": theme, "css": css, "js": init_js, "head": plotly_cdn}
+        _plotly_js_path = os.path.join(_plotly_data_dir, "plotly.min.js")
+        self._plotly_allowed_path = _plotly_data_dir
+        plotly_head = f'<script src="/file={_plotly_js_path}"></script>'
+        ui_kwargs = {"theme": theme, "css": css, "js": init_js, "head": plotly_head}
         _blocks_params = inspect.signature(gr.Blocks.__init__).parameters
         _launch_params = inspect.signature(gr.Blocks.launch).parameters
 
@@ -957,10 +964,13 @@ class TacticalDashboard:
 
     def launch(self, server_port: int = 7860, share: bool = False, **kwargs):
         demo = self.build()
+        # allowed_paths: Plotly.js 로컬 파일을 /file=<경로> URL 로 서빙하기 위해 필요
+        existing = list(kwargs.pop("allowed_paths", None) or [])
         demo.launch(
             server_name="0.0.0.0",
             server_port=server_port,
             share=share,
-            **self._launch_ui,   # 버전별로 해당되는 theme/css/js 만 전달
+            allowed_paths=existing + [self._plotly_allowed_path],
+            **self._launch_ui,
             **kwargs,
         )
