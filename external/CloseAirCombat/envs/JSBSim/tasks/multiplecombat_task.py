@@ -117,6 +117,41 @@ class MultipleCombatTask(SingleCombatTask):
         norm_act[1] = action[1] * 2. / (self.action_space.nvec[1] - 1.) - 1.
         norm_act[2] = action[2] * 2. / (self.action_space.nvec[2] - 1.) - 1.
         norm_act[3] = action[3] * 0.5 / (self.action_space.nvec[3] - 1.) + 0.4
+        return self._enforce_altitude_floor(env, agent_id, norm_act)
+
+    def _enforce_altitude_floor(self, env, agent_id, norm_act: np.ndarray,
+                                 min_altitude: float = None) -> np.ndarray:
+        """에이전트가 최소 허용 고도 이하로 하강하지 못하도록 제어 입력을 보정한다.
+
+        고도 <= min_altitude 이고 하강 중(v_down > 0)인 경우:
+          - elevator를 nose-up 방향으로 클램프 (>= -0.5)
+          - throttle을 최대값(0.9)으로 고정
+
+        Args:
+            env          : 환경 인스턴스
+            agent_id     : 에이전트 ID
+            norm_act     : 정규화된 연속 액션 [aileron, elevator, rudder, throttle]
+            min_altitude : 최소 허용 고도 (m, MSL).
+                           None 이면 config.min_altitude_floor 값 사용 (기본 3000 m).
+
+        Returns:
+            보정된 norm_act. 조건 미충족 시 원본을 그대로 반환.
+        """
+        agent = env.agents[agent_id]
+        if not agent.is_alive:
+            return norm_act
+
+        if min_altitude is None:
+            min_altitude = getattr(self.config, 'min_altitude_floor', 3000.0)
+
+        altitude = agent.get_property_value(c.position_h_sl_m)
+        v_down   = agent.get_property_value(c.velocities_v_down_mps)  # NED +값 = 하강
+
+        if altitude <= min_altitude and v_down > 0:
+            act = norm_act.copy()
+            act[1] = min(act[1], -0.5)  # elevator: nose-up 방향으로 클램프
+            act[3] = 0.9                # throttle: 최대 추력으로 고정
+            return act
         return norm_act
 
     def get_reward(self, env, agent_id, info: dict = ...) -> Tuple[float, dict]:
@@ -163,7 +198,7 @@ class HierarchicalMultipleCombatTask(MultipleCombatTask):
         norm_act[1] = action[1] / 20 - 1.
         norm_act[2] = action[2] / 20 - 1.
         norm_act[3] = action[3] / 58 + 0.4
-        return norm_act
+        return self._enforce_altitude_floor(env, agent_id, norm_act)
 
     def reset(self, env):
         """Task-specific reset, include reward function reset.
