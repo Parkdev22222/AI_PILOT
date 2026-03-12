@@ -817,6 +817,10 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     sim.enemies.append(self.agents[eu])
                     self.agents[eu].enemies.append(sim)
             self.add_temp_simulator(sim)
+            # _save_states_to_db 은 self.agents + pair["friendly_uids"] 를 순회하므로
+            # 두 곳 모두 등록해야 지도에 표시됨
+            self.agents[uid] = sim
+            pair["friendly_uids"].append(uid)
 
         self._support_spawned[pair_idx] = True
         self.pair_phases[pair_idx] = "support"
