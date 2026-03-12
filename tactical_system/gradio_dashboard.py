@@ -483,7 +483,54 @@ class TacticalDashboard:
         return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
-    # 상태 요약 HTML (타이머마다 gr.HTML 직접 교체)
+    # 상태 요약: 정적 골격 (최초 1회) + JS in-place 갱신용 메서드
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_status_skeleton() -> str:
+        return """
+<div class='status-box'>
+  <div class='status-title'>📡 전투 현황 (스텝: <span id='s-step'>-</span>)</div>
+  <table class='status-tbl'>
+    <tr>
+      <td class='blue-text'>🔵 아군</td>
+      <td><div class='bar-wrap'><div class='bar-fill blue-bar' id='s-bar-f' style='width:0%'></div></div></td>
+      <td class='cnt blue-text' id='s-cnt-f'>-/-</td>
+    </tr>
+    <tr>
+      <td class='red-text'>🔴 적군</td>
+      <td><div class='bar-wrap'><div class='bar-fill red-bar' id='s-bar-e' style='width:0%'></div></div></td>
+      <td class='cnt red-text' id='s-cnt-e'>-/-</td>
+    </tr>
+  </table>
+</div>"""
+
+    # ------------------------------------------------------------------
+    # 이벤트 로그: 정적 골격 (최초 1회) + JS ev-tbody 갱신용
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_event_skeleton() -> str:
+        return """
+<div class='event-wrapper'>
+  <div class='event-header'>🚨 이벤트 로그</div>
+  <div class='event-scroll' id='ev-scroll'>
+    <table class='event-tbl'>
+      <thead>
+        <tr>
+          <th>스텝</th><th>유형</th><th>세부 내용</th>
+          <th>LLM 결정</th><th>처리</th>
+        </tr>
+      </thead>
+      <tbody id='ev-tbody'>
+        <tr><td colspan='5' class='no-event'>이벤트 없음</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>"""
+
+    # ------------------------------------------------------------------
+    # 상태 요약 HTML (타이머마다 gr.HTML 직접 교체 — 폴백용으로 유지)
     # ------------------------------------------------------------------
 
     def _make_status_html(self) -> str:
@@ -588,16 +635,46 @@ class TacticalDashboard:
         return rows_html
 
     # ------------------------------------------------------------------
-    # 통합 갱신 콜백 — timer.tick 출력 3개: 지도 / 상태 / 이벤트
-    # visible=False data-carrier + MutationObserver 방식 폐기:
-    #   Gradio가 hidden 컴포넌트에 업데이트를 전달하지 않아 영구 dead state 발생
+    # 데이터 페이로드: status + events 를 단일 JSON으로 묶어 반환
+    # CSS hidden data-carrier(gr.HTML)에 실어 MutationObserver로 감지
+    # → JS가 s-step / s-bar-f / ev-tbody 등 DOM 노드를 직접 수정 (in-place)
+    # ------------------------------------------------------------------
+
+    def _make_data_payload(self) -> str:
+        import html as _html
+        payload = json.dumps({
+            "status": json.loads(self._make_status_data()),
+            "events": self._make_event_rows(),
+        })
+        # JSON 전체를 html.escape → <div> textContent로 안전하게 읽기
+        return f'<div id="dyn-payload">{_html.escape(payload)}</div>'
+
+    def _make_status_data(self) -> str:
+        states = self._states()
+        if not states:
+            return json.dumps({"step": "-", "bar_f": 0, "bar_e": 0,
+                               "cnt_f": "-/-", "cnt_e": "-/-"})
+        alive_f = sum(1 for s in states if s["team"] == "friendly" and s["is_alive"])
+        total_f = sum(1 for s in states if s["team"] == "friendly")
+        alive_e = sum(1 for s in states if s["team"] == "enemy"    and s["is_alive"])
+        total_e = sum(1 for s in states if s["team"] == "enemy")
+        step    = max((s.get("step", 0) for s in states), default=0)
+        return json.dumps({
+            "step":  step,
+            "bar_f": int(alive_f / max(total_f, 1) * 100),
+            "bar_e": int(alive_e / max(total_e, 1) * 100),
+            "cnt_f": f"{alive_f}/{total_f}",
+            "cnt_e": f"{alive_e}/{total_e}",
+        })
+
+    # ------------------------------------------------------------------
+    # 통합 갱신 콜백 — timer.tick 출력 2개: 지도 / data-carrier
     # ------------------------------------------------------------------
 
     def _refresh(self):
         return (
             self._make_map_figure(),
-            self._make_status_html(),
-            self._make_event_html(),
+            self._make_data_payload(),  # CSS hidden gr.HTML → MutationObserver → in-place DOM
         )
 
     # ------------------------------------------------------------------
@@ -624,6 +701,12 @@ class TacticalDashboard:
         /* 로딩 중 opacity 강제 유지 */
         .block, .wrap, .block.generating, .block.pending,
         .wrap.generating, .wrap.pending { opacity:1 !important; }
+
+        /* ── data-carrier: CSS로 숨김 (visible=False 대신 사용)
+         * visible=False → Svelte 조건부 렌더링 → DOM 제거 → 업데이트 미수신
+         * CSS display:none → DOM 유지 → Gradio 업데이트 수신 → MutationObserver 동작 */
+        #data-carrier { display:none !important; height:0 !important;
+                        overflow:hidden !important; margin:0 !important; padding:0 !important; }
 
         /* ── 헤더 ── */
         .header-md h1 { color:#89b4fa; margin-bottom:2px; }
@@ -680,50 +763,84 @@ class TacticalDashboard:
 
         init_js = """
 () => {
-  /* ── 이벤트 로그 스크롤 보존 ──────────────────────────────────────
-   * gr.Timer 가 event-log(gr.HTML)를 통째로 교체할 때마다
-   * MutationObserver 가 감지 → 스크롤 위치 복원
-   */
+  /* ── 이벤트 로그 스크롤 초기값 ── */
   if (sessionStorage.getItem('evAtBottom') === null) {
     sessionStorage.setItem('evAtBottom', '1');
   }
 
-  function _restoreScroll() {
+  /* ── 상태·이벤트 in-place 업데이트 ─────────────────────────────────
+   * gr.Timer → data_carrier(gr.HTML, CSS hidden) innerHTML 갱신
+   * → MutationObserver 감지 → 보이는 DOM 노드만 직접 수정
+   *
+   * data-carrier 는 visible=False 가 아닌 CSS display:none 으로 숨김:
+   *   visible=False → Svelte {#if} → DOM 제거 → 업데이트 미수신
+   *   CSS hidden   → DOM 유지    → Gradio 업데이트 수신 → Observer 동작
+   */
+
+  /* 이벤트 스크롤 리스너 (최초 1회) */
+  var _evScrollBound = false;
+  function _bindEvScroll() {
+    if (_evScrollBound) return;
     var el = document.getElementById('ev-scroll');
     if (!el) return;
-    /* 스크롤 이벤트 리스너 (최초 1회) */
-    if (!el._scrollBound) {
-      el._scrollBound = true;
-      el.addEventListener('scroll', function() {
-        sessionStorage.setItem('evScroll', el.scrollTop);
-        var atBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-        sessionStorage.setItem('evAtBottom', atBot ? '1' : '0');
-      }, {passive: true});
-    }
-    /* 위치 복원 */
-    var atBot = sessionStorage.getItem('evAtBottom') !== '0';
-    if (atBot) {
-      el.scrollTop = el.scrollHeight;
-    } else {
-      var s = sessionStorage.getItem('evScroll');
-      if (s !== null) el.scrollTop = parseInt(s, 10);
-    }
+    _evScrollBound = true;
+    el.addEventListener('scroll', function() {
+      sessionStorage.setItem('evScroll', el.scrollTop);
+      var atBot = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      sessionStorage.setItem('evAtBottom', atBot ? '1' : '0');
+    }, {passive: true});
   }
 
-  /* event-log(gr.HTML) 컴포넌트가 DOM에 나타나면 Observer 등록 */
-  function _setupEventObserver() {
-    var wrapper = document.getElementById('event-log');
+  function _applyPayload() {
+    var el = document.getElementById('dyn-payload');
+    if (!el) return;
+    try {
+      var data = JSON.parse(el.textContent);
+
+      /* 상태 바 in-place 업데이트 (DOM 재생성 없음 → CSS transition 유지) */
+      var s = data.status || {};
+      var stepEl = document.getElementById('s-step');
+      var barF   = document.getElementById('s-bar-f');
+      var barE   = document.getElementById('s-bar-e');
+      var cntF   = document.getElementById('s-cnt-f');
+      var cntE   = document.getElementById('s-cnt-e');
+      if (stepEl) stepEl.textContent = s.step !== undefined ? s.step : '-';
+      if (barF)   barF.style.width   = (s.bar_f || 0) + '%';
+      if (barE)   barE.style.width   = (s.bar_e || 0) + '%';
+      if (cntF)   cntF.textContent   = s.cnt_f || '-/-';
+      if (cntE)   cntE.textContent   = s.cnt_e || '-/-';
+
+      /* 이벤트 tbody in-place 업데이트 (스크롤 위치 보존) */
+      var tbody = document.getElementById('ev-tbody');
+      if (tbody && data.events !== undefined) {
+        tbody.innerHTML = data.events;
+        _bindEvScroll();
+        var scroll = document.getElementById('ev-scroll');
+        if (scroll) {
+          var atBot = sessionStorage.getItem('evAtBottom') !== '0';
+          if (atBot) scroll.scrollTop = scroll.scrollHeight;
+          else {
+            var saved = sessionStorage.getItem('evScroll');
+            if (saved !== null) scroll.scrollTop = parseInt(saved, 10);
+          }
+        }
+      }
+    } catch(e) {}
+  }
+
+  /* data-carrier(gr.HTML, CSS hidden)가 DOM에 나타나면 Observer 연결 */
+  function _setupCarrier() {
+    var wrapper = document.getElementById('data-carrier');
     if (!wrapper) return false;
-    new MutationObserver(_restoreScroll).observe(
-      wrapper, {childList: true, subtree: true}
+    new MutationObserver(_applyPayload).observe(
+      wrapper, {childList: true, subtree: true, characterData: true}
     );
-    _restoreScroll();
     return true;
   }
 
-  if (!_setupEventObserver()) {
-    var _chk = setInterval(function() {
-      if (_setupEventObserver()) clearInterval(_chk);
+  if (!_setupCarrier()) {
+    var _cChk = setInterval(function() {
+      if (_setupCarrier()) clearInterval(_cChk);
     }, 200);
   }
 }
@@ -756,11 +873,10 @@ class TacticalDashboard:
                         show_label=False,
                     )
 
-                # 우측 패널: 상태 요약(타이머가 직접 교체) + 범례
+                # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
                 with gr.Column(scale=1, min_width=220):
-                    # gr.HTML 직접 갱신 — visible=False data-carrier 방식 폐기
-                    status_display = gr.HTML(
-                        value=self._make_status_html(),
+                    gr.HTML(
+                        value=self._make_status_skeleton(),
                         elem_id="status-panel",
                     )
 
@@ -785,18 +901,23 @@ class TacticalDashboard:
                         elem_classes=["legend-md"],
                     )
 
-            # ── 이벤트 로그 (타이머가 직접 교체) ─────────────────────
-            event_display = gr.HTML(
-                value=self._make_event_html(),
+            # ── 이벤트 로그 (정적 골격, JS가 ev-tbody만 갱신) ─────────
+            gr.HTML(
+                value=self._make_event_skeleton(),
                 elem_id="event-log",
             )
 
-            # ── 자동 갱신 (gr.Timer) ───────────────────────────────────
-            # 출력 3개: 지도 / 상태 박스 / 이벤트 로그
+            # ── data-carrier: CSS hidden gr.HTML ─────────────────────
+            # visible=False 대신 CSS #data-carrier{display:none}으로 숨김
+            # → DOM 유지 → Gradio 타이머 업데이트 수신 → MutationObserver 동작
+            data_carrier = gr.HTML(value="", elem_id="data-carrier")
+
+            # ── 자동 갱신 (gr.Timer) ──────────────────────────────────
+            # 출력 2개: 지도 / data-carrier(JSON payload)
             timer = gr.Timer(value=self.refresh_interval)
             timer.tick(
                 fn=self._refresh,
-                outputs=[map_plot, status_display, event_display],
+                outputs=[map_plot, data_carrier],
             )
 
         return demo
