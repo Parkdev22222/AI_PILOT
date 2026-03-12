@@ -247,7 +247,7 @@ class TacticalDashboard:
         states = self._states()
         zones  = self._detect_combat_zones(states)
 
-        fig, ax = plt.subplots(figsize=(9, 8))
+        fig, ax = plt.subplots(figsize=(7, 6))
         fig.patch.set_facecolor("#1e1e2e")
         ax.set_facecolor("#1a1a2e")
 
@@ -351,7 +351,7 @@ class TacticalDashboard:
         fig = self._make_map_figure()
         buf = io.BytesIO()
         fig.savefig(buf, format="png", facecolor="#1e1e2e",
-                    bbox_inches="tight", dpi=110)
+                    bbox_inches="tight", dpi=90)
         plt.close(fig)
         buf.seek(0)
         b64 = base64.b64encode(buf.read()).decode()
@@ -874,7 +874,7 @@ class TacticalDashboard:
             with gr.Row(equal_height=True):
                 # 지도 — matplotlib → base64 PNG → gr.HTML <img>
                 # gr.Plot 의 내부 webp 인코딩 우회, 항상 렌더링 보장
-                with gr.Column(scale=4, min_width=580):
+                with gr.Column(scale=3, min_width=420):
                     map_plot = gr.HTML(value=self._make_map_img_tag())
 
                 # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
