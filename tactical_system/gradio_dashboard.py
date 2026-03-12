@@ -345,20 +345,20 @@ class TacticalDashboard:
         fig.tight_layout(pad=0.5)
         return fig
 
-    def _make_map_img_tag(self) -> str:
-        """matplotlib figure → base64 PNG → <img> HTML 태그.
-        gr.Plot 의 내부 인코딩(webp 등)을 완전히 우회해 항상 렌더링 보장."""
+    def _render_map_b64(self) -> str:
+        """matplotlib figure → base64 PNG 문자열."""
         fig = self._make_map_figure()
         buf = io.BytesIO()
         fig.savefig(buf, format="png", facecolor="#1e1e2e",
                     bbox_inches="tight", dpi=90)
         plt.close(fig)
         buf.seek(0)
-        b64 = base64.b64encode(buf.read()).decode()
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'style="width:100%;height:auto;display:block;" />'
-        )
+        return base64.b64encode(buf.read()).decode()
+
+    def _make_map_carrier(self) -> str:
+        """타이머 갱신용: base64 데이터만 숨겨진 span 에 담아 전달.
+        JS 가 이를 감지해 #map-img 의 src 만 교체 → 플리커 없음."""
+        return f'<span id="map-b64">{self._render_map_b64()}</span>'
 
     # ------------------------------------------------------------------
     # 탭 1: 이벤트 로그 테이블
@@ -673,8 +673,8 @@ class TacticalDashboard:
 
     def _refresh(self):
         return (
-            self._make_map_img_tag(),
-            self._make_data_payload(),
+            self._make_map_carrier(),   # map-carrier → JS가 img.src 업데이트
+            self._make_data_payload(),  # data-carrier → JS가 상태패널 업데이트
         )
 
     # ------------------------------------------------------------------
@@ -702,9 +702,10 @@ class TacticalDashboard:
         .block, .wrap, .block.generating, .block.pending,
         .wrap.generating, .wrap.pending { opacity:1 !important; }
 
-        /* ── 지도 컨테이너 고정 높이: 이미지 교체 시 레이아웃 변동 방지 → 스크롤 초기화 억제 */
+        /* ── 지도: 영구 img 고정, carrier 숨김 ── */
         #map-container { min-height: 500px; }
         #map-container img { display:block; width:100%; height:auto; }
+        #map-carrier { display:none !important; height:0 !important; overflow:hidden !important; }
 
         /* ── data-carrier: CSS로 숨김 (visible=False 대신 사용)
          * visible=False → Svelte 조건부 렌더링 → DOM 제거 → 업데이트 미수신
@@ -848,16 +849,35 @@ class TacticalDashboard:
     }, 200);
   }
 
-  /* ── 스크롤 위치 보존: 지도 이미지 교체 시 스크롤 초기화 방지 ── */
+  /* ── 지도 플리커 제거: map-carrier 변경 감지 → img.src 만 교체 ── */
+  /* img 요소는 DOM 에 영구 고정, src 속성만 바꾸므로 빈 화면이 없음    */
+  (function() {
+    function _setupMapCarrier() {
+      var carrier = document.getElementById('map-carrier');
+      if (!carrier) { setTimeout(_setupMapCarrier, 300); return; }
+      function _applyMap() {
+        var span = document.getElementById('map-b64');
+        if (!span) return;
+        var b64 = span.textContent.trim();
+        if (!b64) return;
+        var img = document.getElementById('map-img');
+        if (img) img.src = 'data:image/png;base64,' + b64;
+      }
+      new MutationObserver(_applyMap).observe(
+        carrier, { childList: true, subtree: true, characterData: true }
+      );
+    }
+    _setupMapCarrier();
+  })();
+
+  /* ── 스크롤 위치 보존 ── */
   (function() {
     var _savedScroll = 0;
-    /* 스크롤 이벤트마다 현재 위치 저장 */
     window.addEventListener('scroll', function() {
       _savedScroll = window.scrollY;
     }, { passive: true });
-    /* 지도 컨테이너(#map-container) DOM 변경 감지 → 스크롤 복원 */
     function _watchMap() {
-      var el = document.getElementById('map-container');
+      var el = document.getElementById('map-carrier');
       if (!el) { setTimeout(_watchMap, 300); return; }
       new MutationObserver(function() {
         requestAnimationFrame(function() {
@@ -896,12 +916,21 @@ class TacticalDashboard:
 
             # ── 메인 행: 지도 + 우측 패널 ─────────────────────────────
             with gr.Row(equal_height=True):
-                # 지도 — matplotlib → base64 PNG → gr.HTML <img>
-                # gr.Plot 의 내부 webp 인코딩 우회, 항상 렌더링 보장
+                # 지도 — 영구 <img id="map-img"> + 숨겨진 map-carrier
+                # 타이머는 carrier 에 base64 만 전달, JS 가 img.src 만 교체
+                # → DOM 요소 교체 없음 → 플리커 없음
                 with gr.Column(scale=3, min_width=420):
-                    map_plot = gr.HTML(
-                        value=self._make_map_img_tag(),
+                    initial_b64 = self._render_map_b64()
+                    gr.HTML(
+                        value=(
+                            f'<img id="map-img" '
+                            f'src="data:image/png;base64,{initial_b64}" '
+                            f'style="width:100%;height:auto;display:block;" />'
+                        ),
                         elem_id="map-container",
+                    )
+                    map_carrier = gr.HTML(
+                        value="", elem_id="map-carrier",
                     )
 
                 # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
@@ -948,7 +977,7 @@ class TacticalDashboard:
             timer = gr.Timer(value=self.refresh_interval)
             timer.tick(
                 fn=self._refresh,
-                outputs=[map_plot, data_carrier],
+                outputs=[map_carrier, data_carrier],
             )
 
         return demo
