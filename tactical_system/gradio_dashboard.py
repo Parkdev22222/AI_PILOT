@@ -672,25 +672,19 @@ class TacticalDashboard:
     # ------------------------------------------------------------------
     # 지도 HTML 생성 — gr.HTML 컴포넌트용
     # ------------------------------------------------------------------
-    # Gradio 6.x 가 번들하는 Plotly.js 는 구버전이라 Scattergeo 가 흰 화면이 됨.
-    # Plotly Python 6.x 는 Plotly.js 3.x 를 사용하므로, to_html() 로 직접 embed.
-    # include_plotlyjs='cdn' → 첫 로드 후 브라우저 캐시 → 이후 갱신은 ~7KB 만 전송.
-    # Plotly.react() 사용 → 동일 div 재활용 시 줌/패닝 상태 유지.
+    # pio.to_html(include_plotlyjs=<local_url>) 로 완전한 HTML 을 매번 생성.
+    # Plotly.js 는 /file=<경로> 로 브라우저가 1회 내려받은 뒤 캐시 사용.
     # ------------------------------------------------------------------
 
     def _make_map_html(self) -> str:
         fig = self._make_map_figure()
-        fig_json = fig.to_json()
-        return f"""<div id="tactical-map" style="height:650px;width:100%;background:#1e1e2e;"></div>
-<script>(function(){{
-  function render(){{
-    var el=document.getElementById('tactical-map');
-    if(!el||!window.Plotly){{setTimeout(render,100);return;}}
-    var fig={fig_json};
-    Plotly.react(el,fig.data,fig.layout,{{responsive:true,displayModeBar:false}});
-  }}
-  render();
-}})();</script>"""
+        return pio.to_html(
+            fig,
+            include_plotlyjs=f"/file={self._plotly_js_path}",
+            full_html=False,
+            div_id="tactical-map",
+            config={"responsive": True, "displayModeBar": False},
+        )
 
     # ------------------------------------------------------------------
     # 통합 갱신 콜백 — timer.tick 출력 2개: 지도 HTML / data-carrier
@@ -879,17 +873,14 @@ class TacticalDashboard:
             primary_hue=gr.themes.colors.blue,
             neutral_hue=gr.themes.colors.slate,
         )
-        # Plotly.js 로컬 파일 서빙 — CDN 차단 환경 대응
-        # Gradio allowed_paths 로 plotly 패키지 디렉터리를 노출하고
-        # /file=<절대경로> URL 로 참조 → 브라우저가 1회 로드 후 캐시
+        # Plotly.js 로컬 경로 저장 — _make_map_html() 및 launch(allowed_paths) 에서 사용
         import plotly as _plotly_pkg
         _plotly_data_dir = os.path.join(
             os.path.dirname(_plotly_pkg.__file__), "package_data"
         )
-        _plotly_js_path = os.path.join(_plotly_data_dir, "plotly.min.js")
+        self._plotly_js_path     = os.path.join(_plotly_data_dir, "plotly.min.js")
         self._plotly_allowed_path = _plotly_data_dir
-        plotly_head = f'<script src="/file={_plotly_js_path}"></script>'
-        ui_kwargs = {"theme": theme, "css": css, "js": init_js, "head": plotly_head}
+        ui_kwargs = {"theme": theme, "css": css, "js": init_js}
         _blocks_params = inspect.signature(gr.Blocks.__init__).parameters
         _launch_params = inspect.signature(gr.Blocks.launch).parameters
 
