@@ -702,6 +702,10 @@ class TacticalDashboard:
         .block, .wrap, .block.generating, .block.pending,
         .wrap.generating, .wrap.pending { opacity:1 !important; }
 
+        /* ── 지도 컨테이너 고정 높이: 이미지 교체 시 레이아웃 변동 방지 → 스크롤 초기화 억제 */
+        #map-container { min-height: 500px; }
+        #map-container img { display:block; width:100%; height:auto; }
+
         /* ── data-carrier: CSS로 숨김 (visible=False 대신 사용)
          * visible=False → Svelte 조건부 렌더링 → DOM 제거 → 업데이트 미수신
          * CSS display:none → DOM 유지 → Gradio 업데이트 수신 → MutationObserver 동작 */
@@ -843,6 +847,26 @@ class TacticalDashboard:
       if (_setupCarrier()) clearInterval(_cChk);
     }, 200);
   }
+
+  /* ── 스크롤 위치 보존: 지도 이미지 교체 시 스크롤 초기화 방지 ── */
+  (function() {
+    var _savedScroll = 0;
+    /* 스크롤 이벤트마다 현재 위치 저장 */
+    window.addEventListener('scroll', function() {
+      _savedScroll = window.scrollY;
+    }, { passive: true });
+    /* 지도 컨테이너(#map-container) DOM 변경 감지 → 스크롤 복원 */
+    function _watchMap() {
+      var el = document.getElementById('map-container');
+      if (!el) { setTimeout(_watchMap, 300); return; }
+      new MutationObserver(function() {
+        requestAnimationFrame(function() {
+          window.scrollTo({ top: _savedScroll, behavior: 'instant' });
+        });
+      }).observe(el, { childList: true, subtree: true });
+    }
+    _watchMap();
+  })();
 }
 """
         # Gradio 버전별로 theme/css/js 허용 위치가 다름:
@@ -875,7 +899,10 @@ class TacticalDashboard:
                 # 지도 — matplotlib → base64 PNG → gr.HTML <img>
                 # gr.Plot 의 내부 webp 인코딩 우회, 항상 렌더링 보장
                 with gr.Column(scale=3, min_width=420):
-                    map_plot = gr.HTML(value=self._make_map_img_tag())
+                    map_plot = gr.HTML(
+                        value=self._make_map_img_tag(),
+                        elem_id="map-container",
+                    )
 
                 # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
                 with gr.Column(scale=1, min_width=220):
