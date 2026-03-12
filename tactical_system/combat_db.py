@@ -81,6 +81,7 @@ class CombatDB:
                     health          REAL,
                     missiles_left   INTEGER,
                     flight_phase    TEXT,               -- 'approach'|'combat'|'rtb'|'reload'|'support'
+                    death_cause     TEXT DEFAULT 'alive', -- 'alive'|'shot_down'|'crashed'
                     FOREIGN KEY (sim_id) REFERENCES simulation_info(sim_id)
                 );
 
@@ -112,6 +113,14 @@ class CombatDB:
                 );
             """)
             conn.commit()
+            # Migration: add death_cause column to existing DBs
+            try:
+                conn.execute(
+                    "ALTER TABLE aircraft_state ADD COLUMN death_cause TEXT DEFAULT 'alive'"
+                )
+                conn.commit()
+            except Exception:
+                pass  # Column already exists
             conn.close()
 
     # ------------------------------------------------------------------
@@ -221,17 +230,18 @@ class CombatDB:
         health: float,
         missiles_left: int,
         flight_phase: str,
+        death_cause: str = "alive",
     ):
         with self._lock:
             conn = self._get_conn()
             conn.execute(
                 "INSERT INTO aircraft_state "
                 "(sim_id, step, timestamp, aircraft_uid, team, formation_id, base_name, "
-                "is_alive, lon, lat, alt, heading_deg, speed_mps, health, missiles_left, flight_phase) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "is_alive, lon, lat, alt, heading_deg, speed_mps, health, missiles_left, flight_phase, death_cause) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sim_id, step, timestamp, aircraft_uid, team, formation_id,
                  base_name, int(is_alive), lon, lat, alt, heading_deg,
-                 speed_mps, health, missiles_left, flight_phase),
+                 speed_mps, health, missiles_left, flight_phase, death_cause),
             )
             conn.commit()
             conn.close()

@@ -241,6 +241,118 @@ class LLMCommander:
         return result
 
     # ------------------------------------------------------------------
+    # 3단계: 아군-적군 편대 1:1 배정 (enemies 리스트 설정 전 LLM 판단)
+    # ------------------------------------------------------------------
+
+    def assign_formation_targets(self, formation_pairs: List[Dict]) -> List[Dict]:
+        """
+        아군 편대 각각이 어느 적 편대를 전담 교전할지 LLM이 결정.
+
+        Parameters
+        ----------
+        formation_pairs : list of dict
+            TacticalCombatEnv.formation_pairs 구조:
+            [{"friendly_base": {"name":…,"lon":…,"lat":…},
+              "enemy_base":    {"name":…,"lon":…,"lat":…},
+              "friendly_uids": […], "enemy_uids": […]}, …]
+
+        Returns
+        -------
+        list of dict  예시:
+          [
+            {"friendly_base": "성남공군기지", "enemy_base": "원산기지"},
+            {"friendly_base": "강릉공군기지", "enemy_base": "평양공군기지"}
+          ]
+          TacticalCombatEnv.apply_formation_assignment() 에 직접 전달 가능.
+        """
+        n = len(formation_pairs)
+
+        # 편대 정보 문자열 생성
+        friendly_lines = []
+        enemy_lines = []
+        for i, pair in enumerate(formation_pairs):
+            fb = pair["friendly_base"]
+            eb = pair["enemy_base"]
+            f_info = FRIENDLY_BASES.get(fb["name"], {})
+            e_info = ENEMY_BASES.get(eb["name"], {})
+            f_desc = f_info.get("description", fb["name"])
+            e_desc = e_info.get("description", eb["name"])
+            friendly_lines.append(
+                f"  - {fb['name']}: {f_desc} "
+                f"(경도 {fb['lon']:.2f}°, 위도 {fb['lat']:.2f}°, "
+                f"출격 기체 {len(pair['friendly_uids'])}대)"
+            )
+            enemy_lines.append(
+                f"  - {eb['name']}: {e_desc} "
+                f"(경도 {eb['lon']:.2f}°, 위도 {eb['lat']:.2f}°, "
+                f"출격 기체 {len(pair['enemy_uids'])}대)"
+            )
+
+        system_prompt = (
+            "당신은 대한민국 공군 전술 지휘관 AI입니다. "
+            "아군 편대와 적 편대를 1:1로 배정하여 각 아군 편대가 "
+            "어느 적 편대를 전담 교전할지 결정하십시오. "
+            "지리적 근접성, 방어 우선순위, 전술적 효율성을 고려하십시오. "
+            "반드시 JSON 형식으로만 응답하십시오."
+        )
+
+        user_prompt = f"""
+편대 배정 임무:
+- 아군 편대 ({n}개):
+{chr(10).join(friendly_lines)}
+
+- 적군 편대 ({n}개):
+{chr(10).join(enemy_lines)}
+
+각 아군 편대가 전담할 적 편대를 1:1로 배정하십시오.
+지리적으로 가까운 기지끼리 배정하되, 전술적 균형도 고려하십시오.
+
+다음 JSON 형식으로 응답하십시오:
+```json
+{{
+  "assignment": [
+    {{"friendly_base": "아군기지명", "enemy_base": "담당_적기지명"}},
+    ...
+  ],
+  "reasoning": "배정 근거"
+}}
+```
+"""
+        raw = self._generate(system_prompt, user_prompt)
+        logger.debug(f"[LLM assign_formation_targets response]\n{raw}")
+
+        result = self._extract_json(raw)
+        assignment = None
+        if result and "assignment" in result:
+            assignment = result["assignment"]
+
+        if not assignment or len(assignment) != n:
+            logger.warning("편대 배정 파싱 실패 또는 수 불일치. 기본값(순서 매칭) 사용.")
+            assignment = [
+                {
+                    "friendly_base": formation_pairs[i]["friendly_base"]["name"],
+                    "enemy_base":    formation_pairs[i]["enemy_base"]["name"],
+                }
+                for i in range(n)
+            ]
+
+        # DB 기록
+        if self.db and self.sim_id >= 0:
+            self.db.log_llm_decision(
+                sim_id=self.sim_id,
+                step=0,
+                timestamp=0.0,
+                decision_type="formation_assignment",
+                input_prompt=user_prompt,
+                output_decision=json.dumps(
+                    {"assignment": assignment}, ensure_ascii=False
+                ),
+                reasoning=(result or {}).get("reasoning", ""),
+            )
+
+        return assignment
+
+    # ------------------------------------------------------------------
     # 5단계: 이벤트 발생 → LLM 판단
     # ------------------------------------------------------------------
 

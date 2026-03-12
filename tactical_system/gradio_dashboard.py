@@ -506,6 +506,66 @@ class TacticalDashboard:
 </div>"""
 
     # ------------------------------------------------------------------
+    # 기체 현황 패널: 정적 골격 + JS ac-tbody 갱신용
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_aircraft_status_skeleton() -> str:
+        return """
+<div class='ac-status-wrapper'>
+  <div class='ac-status-header'>✈ 기체 현황</div>
+  <div class='ac-status-scroll'>
+    <table class='ac-status-tbl'>
+      <thead>
+        <tr><th>UID</th><th>팀</th><th>상태</th><th>기지</th></tr>
+      </thead>
+      <tbody id='ac-tbody'>
+        <tr><td colspan='4' class='no-event'>대기 중...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>"""
+
+    def _make_aircraft_status_rows(self) -> str:
+        """<tbody> 내부 <tr> 행들 — JS 가 ac-tbody.innerHTML 에 삽입."""
+        import html as _html
+        states = self._states()
+        if not states:
+            return "<tr><td colspan='4' class='no-event'>데이터 없음</td></tr>"
+
+        rows_html = ""
+        for s in sorted(states, key=lambda x: (x["team"] != "friendly", x["aircraft_uid"])):
+            uid = _html.escape(s["aircraft_uid"])
+            if s["team"] == "friendly":
+                team_str = "🔵 아군"
+                team_cls = "blue-text"
+            else:
+                team_str = "🔴 적군"
+                team_cls = "red-text"
+
+            cause = s.get("death_cause", "alive")
+            if s["is_alive"]:
+                status_str = "생존"
+                status_cls = "status-alive"
+            elif cause == "crashed":
+                status_str = "추락"
+                status_cls = "status-crashed"
+            else:
+                status_str = "격추"
+                status_cls = "status-dead"
+
+            base = _html.escape(s.get("base_name", "-"))
+            rows_html += (
+                f"<tr>"
+                f"<td class='{team_cls}'>{uid}</td>"
+                f"<td class='{team_cls}'>{team_str}</td>"
+                f"<td class='{status_cls}'>{status_str}</td>"
+                f"<td>{base}</td>"
+                f"</tr>\n"
+            )
+        return rows_html
+
+    # ------------------------------------------------------------------
     # 이벤트 로그: 정적 골격 (최초 1회) + JS ev-tbody 갱신용
     # ------------------------------------------------------------------
 
@@ -645,6 +705,7 @@ class TacticalDashboard:
         payload = json.dumps({
             "status": json.loads(self._make_status_data()),
             "events": self._make_event_rows(),
+            "aircraft": self._make_aircraft_status_rows(),
         })
         # JSON 전체를 html.escape → <div> textContent로 안전하게 읽기
         return f'<div id="dyn-payload">{_html.escape(payload)}</div>'
@@ -740,6 +801,25 @@ class TacticalDashboard:
         .legend-md { background:#313244; border-radius:8px; padding:10px 14px; font-size:0.82rem; }
         .legend-md table { font-size:0.82rem; }
 
+        /* ── 기체 현황 패널 ── */
+        .ac-status-wrapper { background:#313244; border-radius:8px; overflow:hidden; margin-top:8px; }
+        .ac-status-header  {
+          background:#45475a; padding:6px 14px;
+          font-weight:700; color:#a6e3a1; font-size:0.88rem;
+        }
+        .ac-status-scroll  { max-height:220px; overflow-y:auto; padding:4px; }
+        .ac-status-tbl     { width:100%; border-collapse:collapse; font-size:0.80rem; }
+        .ac-status-tbl thead tr { background:#1e1e2e; position:sticky; top:0; z-index:2; }
+        .ac-status-tbl th  { padding:5px 6px; color:#a6adc8; font-weight:600;
+                             border-bottom:1px solid #45475a; white-space:nowrap; }
+        .ac-status-tbl td  { padding:4px 6px; border-bottom:1px solid #313244;
+                             color:#cdd6f4; white-space:nowrap; }
+        .ac-status-tbl tr:last-child td { border-bottom:none; }
+        .ac-status-tbl tr:hover td { background:#383850; }
+        .status-alive   { color:#a6e3a1; font-weight:700; }
+        .status-dead    { color:#f38ba8; font-weight:700; }
+        .status-crashed { color:#fab387; font-weight:700; }
+
         /* ── 이벤트 로그 ── */
         .event-wrapper { background:#313244; border-radius:8px; overflow:hidden; }
         .event-header  {
@@ -829,6 +909,12 @@ class TacticalDashboard:
             if (saved !== null) scroll.scrollTop = parseInt(saved, 10);
           }
         }
+      }
+
+      /* 기체 현황 tbody in-place 업데이트 */
+      var acTbody = document.getElementById('ac-tbody');
+      if (acTbody && data.aircraft !== undefined) {
+        acTbody.innerHTML = data.aircraft;
       }
     } catch(e) {}
   }
@@ -933,11 +1019,16 @@ class TacticalDashboard:
                         value="", elem_id="map-carrier",
                     )
 
-                # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 범례
+                # 우측 패널: 상태 요약(정적 골격, JS가 in-place 갱신) + 기체 현황 + 범례
                 with gr.Column(scale=1, min_width=220):
                     gr.HTML(
                         value=self._make_status_skeleton(),
                         elem_id="status-panel",
+                    )
+
+                    gr.HTML(
+                        value=self._make_aircraft_status_skeleton(),
+                        elem_id="aircraft-status-panel",
                     )
 
                     gr.HTML(

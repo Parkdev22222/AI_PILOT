@@ -933,6 +933,14 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         vn, ve, vd = sim.get_velocity()
         speed = float(np.linalg.norm([vn, ve, vd]))
         missiles = getattr(sim, "num_left_missiles", 0)
+        health = float(sim.bloods)
+
+        if sim.is_alive:
+            death_cause = "alive"
+        elif health <= 0:
+            death_cause = "shot_down"
+        else:
+            death_cause = "crashed"
 
         self.db.save_aircraft_state(
             sim_id=self.sim_id,
@@ -946,9 +954,10 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             lon=lon, lat=lat, alt=alt,
             heading_deg=heading_deg,
             speed_mps=speed,
-            health=float(sim.bloods),
+            health=health,
             missiles_left=missiles,
             flight_phase=phase,
+            death_cause=death_cause,
         )
 
     def _get_uid_phase(self, uid: str, pair_idx: int) -> str:
@@ -975,3 +984,72 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
     ):
         self._friendly_formation_ids = friendly_ids
         self._enemy_formation_ids = enemy_ids
+
+    # ------------------------------------------------------------------
+    # 편대 타겟 배정 (LLM 결정 적용)
+    # ------------------------------------------------------------------
+
+    def apply_formation_assignment(self, assignment: List[Dict]):
+        """
+        LLM이 결정한 아군-적군 편대 배정을 실제 기체의 enemies 리스트에 적용.
+
+        Parameters
+        ----------
+        assignment : list of dict
+            [{"friendly_base": "성남공군기지", "enemy_base": "원산기지"}, ...]
+            LLMCommander.assign_formation_targets() 의 반환값.
+
+        동작:
+          1. assignment 에서 아군 기지명 → 적군 기지명 매핑 추출
+          2. formation_pairs 에서 각 pair 의 friendly_base.name 으로 매핑 검색
+          3. 매핑된 enemy_base.name 을 가진 pair 의 enemy_uids 를 가져와
+             아군 각 기체의 sim.enemies = [해당 적 편대 sim 목록] 으로 업데이트
+          4. 적군 기체도 대칭 업데이트 (적군 기체의 enemies → 해당 아군 편대)
+        """
+        # 기지명 → pair_idx 역매핑
+        friendly_base_to_idx: Dict[str, int] = {
+            p["friendly_base"]["name"]: i for i, p in enumerate(self.formation_pairs)
+        }
+        enemy_base_to_idx: Dict[str, int] = {
+            p["enemy_base"]["name"]: i for i, p in enumerate(self.formation_pairs)
+        }
+
+        for entry in assignment:
+            f_base = entry.get("friendly_base", "")
+            e_base = entry.get("enemy_base", "")
+            f_idx = friendly_base_to_idx.get(f_base)
+            e_idx = enemy_base_to_idx.get(e_base)
+            if f_idx is None or e_idx is None:
+                logger.warning(
+                    f"apply_formation_assignment: 매핑 실패 — "
+                    f"friendly_base={f_base!r}, enemy_base={e_base!r}"
+                )
+                continue
+
+            f_pair = self.formation_pairs[f_idx]
+            e_pair = self.formation_pairs[e_idx]
+
+            # 아군 기체의 enemies → 해당 적군 편대 기체만
+            enemy_sims = [
+                self.agents[eu]
+                for eu in e_pair["enemy_uids"]
+                if eu in self.agents
+            ]
+            for fu in f_pair["friendly_uids"]:
+                if fu in self.agents:
+                    self.agents[fu].enemies = list(enemy_sims)
+
+            # 적군 기체의 enemies → 해당 아군 편대 기체만
+            friendly_sims = [
+                self.agents[fu]
+                for fu in f_pair["friendly_uids"]
+                if fu in self.agents
+            ]
+            for eu in e_pair["enemy_uids"]:
+                if eu in self.agents:
+                    self.agents[eu].enemies = list(friendly_sims)
+
+            logger.info(
+                f"편대 배정 적용: {f_base} ({len(friendly_sims)}기) "
+                f"↔ {e_base} ({len(enemy_sims)}기)"
+            )
