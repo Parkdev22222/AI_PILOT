@@ -230,6 +230,7 @@ class TacticalDashboard:
         fig = go.Figure()
 
         # ── Trace 0: 교전 구역 (항상 단일 trace, None 구분자로 여러 원 연결) ──
+        # go.Scattergeo는 오프라인 동작 (Plotly 내장 지리 데이터 사용)
         zone_lons: List[Optional[float]] = []
         zone_lats: List[Optional[float]] = []
         for zone in zones:
@@ -241,12 +242,12 @@ class TacticalDashboard:
                 zone_lats.append(None)
             zone_lons.extend(lons)
             zone_lats.extend(lats)
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattergeo(
             lon=zone_lons, lat=zone_lats,
             mode="lines",
-            line=dict(color="rgba(255,0,0,0.9)", width=2),
+            line=dict(color="rgba(255,80,80,0.9)", width=2),
             fill="toself",
-            fillcolor="rgba(255,0,0,0.12)",
+            fillcolor="rgba(255,0,0,0.15)",
             name="교전구역",
             hoverinfo="skip",
             showlegend=bool(zones),
@@ -254,14 +255,15 @@ class TacticalDashboard:
 
         # ── Trace 1: 아군 기지 (항상 고정) ───────────────────────────
         fb = list(FRIENDLY_BASES.items())
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattergeo(
             lon=[v["lon"] for _, v in fb],
             lat=[v["lat"] for _, v in fb],
             mode="markers+text",
-            marker=dict(size=18, color="#1a6fd4", symbol="circle"),
+            marker=dict(size=14, color="#1a6fd4", symbol="square",
+                        line=dict(color="#89b4fa", width=2)),
             text=["✈ " + n for n, _ in fb],
             textposition="top right",
-            textfont=dict(size=11, color="#89b4fa"),
+            textfont=dict(size=10, color="#89b4fa"),
             name="아군 기지",
             hovertext=[f"아군 기지: {n}" for n, _ in fb],
             hoverinfo="text",
@@ -270,14 +272,15 @@ class TacticalDashboard:
 
         # ── Trace 2: 적군 기지 (항상 고정) ───────────────────────────
         eb = list(ENEMY_BASES.items())
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattergeo(
             lon=[v["lon"] for _, v in eb],
             lat=[v["lat"] for _, v in eb],
             mode="markers+text",
-            marker=dict(size=18, color="#c0392b", symbol="circle"),
+            marker=dict(size=14, color="#c0392b", symbol="square",
+                        line=dict(color="#f38ba8", width=2)),
             text=["✈ " + n for n, _ in eb],
             textposition="top right",
-            textfont=dict(size=11, color="#f38ba8"),
+            textfont=dict(size=10, color="#f38ba8"),
             name="적군 기지",
             hovertext=[f"적군 기지: {n}" for n, _ in eb],
             hoverinfo="text",
@@ -302,33 +305,38 @@ class TacticalDashboard:
             )
 
         # ── Trace 3·4·5·6: 항공기 (빈 배열이어도 항상 4개 trace 유지) ──
-        # Scattermapbox는 open-street-map 스타일에서 "circle" 만 지원
-        # 기체 구분은 마커 크기·색상·텍스트 이모지로 표현
-        for group, color, emoji, label, sz in [
-            (alive_f, "#00b4ff", "▲", "아군 (생존)", 16),
-            (dead_f,  "#7fb8d4", "✕", "아군 (손실)",  9),
-            (alive_e, "#ff3030", "▲", "적군 (생존)", 16),
-            (dead_e,  "#d47f7f", "✕", "적군 (손실)",  9),
+        # go.Scattergeo: triangle-up / x 등 마커 심볼 완전 지원 (오프라인 OK)
+        for group, color, symbol, label, sz in [
+            (alive_f, "#00b4ff", "triangle-up", "아군 (생존)", 14),
+            (dead_f,  "#7fb8d4", "x",           "아군 (손실)",  9),
+            (alive_e, "#ff3030", "triangle-up", "적군 (생존)", 14),
+            (dead_e,  "#d47f7f", "x",           "적군 (손실)",  9),
         ]:
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattergeo(
                 lon=[s["lon"] for s in group],
                 lat=[s["lat"] for s in group],
-                mode="markers+text",
-                marker=dict(size=sz, color=color, symbol="circle"),
-                text=[emoji] * len(group),
-                textposition="middle center",
-                textfont=dict(size=10, color="#ffffff"),
+                mode="markers",
+                marker=dict(size=sz, color=color, symbol=symbol),
                 name=label,
                 hovertext=[_hover(s) for s in group],
                 hoverinfo="text" if group else "skip",
                 showlegend=True,
             ))
 
+        # ── 지도 레이아웃 (완전 오프라인, Plotly 내장 데이터) ──────────
         fig.update_layout(
-            mapbox=dict(
-                style="open-street-map",
-                center=dict(lon=self.map_center[0], lat=self.map_center[1]),
-                zoom=self.map_zoom,
+            geo=dict(
+                scope="asia",
+                projection_type="mercator",
+                showland=True,       landcolor="#2d2d44",
+                showocean=True,      oceancolor="#1a1a2e",
+                showcoastlines=True, coastlinecolor="#6272a4",
+                showcountries=True,  countrycolor="#6272a4",
+                showlakes=False,     showrivers=False,
+                bgcolor="#1e1e2e",
+                # 한반도 중심 초기 뷰
+                lonaxis=dict(range=[124.0, 131.0]),
+                lataxis=dict(range=[34.5, 43.0]),
             ),
             margin=dict(l=0, r=0, t=0, b=0),
             paper_bgcolor="#1e1e2e",
@@ -343,7 +351,7 @@ class TacticalDashboard:
                 xanchor="left", yanchor="top",
             ),
             height=650,
-            uirevision="map",  # 항상 동일 → 사용자 줌/패닝 유지
+            uirevision="map",  # 항상 동일 → Plotly.react() 시 줌/패닝 보존
         )
         return fig
 
@@ -702,76 +710,12 @@ class TacticalDashboard:
     sessionStorage.setItem('evAtBottom', '1');
   }
 
-  /* ── 지도 줌/패닝 보존 ──
-   * Plotly.react() 후에도 사용자가 설정한 뷰포트를 유지한다.
-   * window.Plotly 없이 Plotly가 DOM 노드에 추가하는 .on() API +
-   * Mapbox GL JS의 jumpTo()를 직접 사용한다.
+  /*
+   * ── 지도 줌/패닝 보존 ──
+   * go.Scattergeo + uirevision="map" 조합으로 Plotly.react() 시
+   * 사용자의 줌/패닝이 자동으로 보존된다.
+   * (Mapbox GL 전용 jumpTo 코드 불필요 — 완전 오프라인 동작)
    */
-  window._tvp = null;   // 마지막으로 저장한 뷰포트
-
-  function setupMapListeners(div) {
-    if (div._tvpReady) return;
-    div._tvpReady = true;
-
-    var restoring = false;
-    var saveTimer = null;
-
-    function getMap() {
-      try { return div._fullLayout.mapbox._subplot.map; } catch(e) { return null; }
-    }
-
-    function saveViewport() {
-      var map = getMap();
-      if (!map) return;
-      window._tvp = {
-        center: [map.getCenter().lng, map.getCenter().lat],
-        zoom:    map.getZoom(),
-        bearing: map.getBearing(),
-        pitch:   map.getPitch(),
-      };
-    }
-
-    function restoreViewport() {
-      if (!window._tvp) return;
-      var map = getMap();
-      if (!map) return;
-      restoring = true;
-      map.jumpTo({
-        center:  window._tvp.center,
-        zoom:    window._tvp.zoom,
-        bearing: window._tvp.bearing,
-        pitch:   window._tvp.pitch,
-      });
-      setTimeout(function() { restoring = false; }, 600);
-    }
-
-    /* Plotly가 DOM 노드에 .on() 을 추가할 때까지 대기 */
-    var chk = setInterval(function() {
-      if (typeof div.on !== 'function') return;
-      clearInterval(chk);
-
-      /* 사용자 인터랙션(줌/패닝) 후 250ms 디바운스로 저장 */
-      div.on('plotly_relayout', function() {
-        if (restoring) return;
-        clearTimeout(saveTimer);
-        saveTimer = setTimeout(saveViewport, 250);
-      });
-
-      /* Plotly.react() 완료 후 뷰포트 복원 */
-      div.on('plotly_afterplot', function() {
-        restoreViewport();
-      });
-    }, 100);
-  }
-
-  /* Plotly 차트 div(.js-plotly-plot)가 DOM에 나타나면 리스너 등록 */
-  var obs = new MutationObserver(function() {
-    var d = document.querySelector('.js-plotly-plot');
-    if (d) setupMapListeners(d);
-  });
-  obs.observe(document.body, { childList: true, subtree: true });
-  var d = document.querySelector('.js-plotly-plot');
-  if (d) setupMapListeners(d);
 
   /* ── 상태·이벤트 in-place 업데이트 (깜빡임 없음) ──────────────────
    * gr.Timer → data_carrier(gr.HTML, hidden) innerHTML 갱신
