@@ -327,6 +327,8 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_major_loss_id: Optional[int] = None
         self.event_ammo_depleted: bool = False
         self.event_ammo_depleted_ids: Dict[str, int] = {}  # uid → event_id
+        # 편대 단위 무장 고갈: pair_idx → event_id
+        self.event_formation_ammo_depleted: Dict[int, int] = {}
 
         # RL RNN 상태
         n_agents = len(self.ego_ids)
@@ -378,6 +380,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_major_loss_id = None
         self.event_ammo_depleted = False
         self.event_ammo_depleted_ids.clear()
+        self.event_formation_ammo_depleted.clear()
         self.reload_pending.clear()
         self.reloaded_returning.clear()
         self.pair_phases = {i: "approach" for i in range(len(self.formation_pairs))}
@@ -424,6 +427,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         info["event_major_loss_id"] = self.event_major_loss_id
         info["event_ammo_depleted"] = self.event_ammo_depleted
         info["event_ammo_depleted_ids"] = dict(self.event_ammo_depleted_ids)
+        info["event_formation_ammo_depleted"] = dict(self.event_formation_ammo_depleted)
 
         return obs, share_obs, rewards, dones, info
 
@@ -734,7 +738,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     f"[이벤트] 아군 전력 50% 이상 손실 (event_id={event_id})"
                 )
 
-        # ── 무장 고갈 ──────────────────────────────────────────────────
+        # ── 개별 기체 무장 고갈 ────────────────────────────────────────
         for uid in self.ego_ids:
             if uid in self.event_ammo_depleted_ids:
                 continue
@@ -758,9 +762,78 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     f"[이벤트] {uid} 무장 고갈 (event_id={event_id})"
                 )
 
+        # ── 편대 단위 무장 고갈 ────────────────────────────────────────
+        # 편대 내 생존 기체가 전부 미사일 0발이면 formation_ammo_depleted 발생
+        for i, pair in enumerate(self.formation_pairs):
+            if i in self.event_formation_ammo_depleted:
+                continue
+            if self.pair_phases[i] in ("rtb_loss", "rtb_ammo", "done"):
+                continue
+            alive_uids = [
+                u for u in pair["friendly_uids"]
+                if u in self.agents and self.agents[u].is_alive
+                and u not in self.reload_pending
+                and u not in self.reloaded_returning
+            ]
+            if not alive_uids:
+                continue   # 생존 기체 없음 → 손실 이벤트가 이미 처리
+            if all(self.agents[u].num_left_missiles == 0 for u in alive_uids):
+                details = {
+                    "pair_idx": i,
+                    "friendly_base": pair["friendly_base"]["name"],
+                    "enemy_base": pair["enemy_base"]["name"],
+                    "alive_friendly": len(alive_uids),
+                    "alive_enemy": sum(
+                        1 for u in pair["enemy_uids"]
+                        if u in self.agents and self.agents[u].is_alive
+                    ),
+                    "step": step,
+                }
+                event_id = self.db.log_event(
+                    self.sim_id, step, ts, "formation_ammo_depleted", details
+                )
+                self.event_formation_ammo_depleted[i] = event_id
+                logger.warning(
+                    f"[이벤트] 편대 {i} ({pair['friendly_base']['name']}) "
+                    f"전 기체 무장 고갈 (event_id={event_id})"
+                )
+
     # ------------------------------------------------------------------
     # 이벤트 처리 (컨트롤러에서 LLM 결정 후 호출)
     # ------------------------------------------------------------------
+
+    def handle_formation_ammo_rtb(self, pair_idx: int):
+        """
+        편대 단위 무장 고갈 처리: 해당 편대의 생존 기체 전부 기지 복귀.
+        지원 편대가 스폰되면 이 편대를 교체.
+
+        Parameters
+        ----------
+        pair_idx : 무장 고갈된 편대쌍 인덱스
+        """
+        pair = self.formation_pairs[pair_idx]
+        home = pair["friendly_base"]
+        enm_lon, enm_lat = self._formation_centroid(pair["enemy_uids"])
+
+        for uid in pair["friendly_uids"]:
+            if uid not in self.agents:
+                continue
+            sim = self.agents[uid]
+            if not sim.is_alive:
+                continue
+            if uid in self.reload_pending or uid in self.reloaded_returning:
+                continue
+            # 재장착 없이 순수 RTB (무장 고갈 편대 복귀)
+            self.reload_pending[uid] = {
+                "home_lon": home["lon"],
+                "home_lat": home["lat"],
+                "combat_lon": enm_lon,
+                "combat_lat": enm_lat,
+                "_no_reload": True,   # 재장착 없이 그냥 복귀
+            }
+            logger.info(f"[처리] 편대{pair_idx} 무장고갈 RTB: {uid} → {home['name']}")
+
+        self.pair_phases[pair_idx] = "rtb_ammo"
 
     def handle_major_loss_rtb(self):
         """아군 전체 RTB: 잔존 기체 기지 방향으로 전환."""
@@ -861,16 +934,21 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             lon, lat, _ = sim.get_geodetic()
             dist = _haversine_m(lon, lat, info["home_lon"], info["home_lat"])
             if dist <= RELOAD_DISTANCE_M:
-                # 재장착
-                sim.num_left_missiles = RELOAD_MISSILES
-                sim.num_missiles = RELOAD_MISSILES
-                self.reloaded_returning[uid] = {
-                    "combat_lon": info["combat_lon"],
-                    "combat_lat": info["combat_lat"],
-                    "missiles": RELOAD_MISSILES,
-                }
-                completed_reload.append(uid)
-                logger.info(f"[처리] {uid} 재장착 완료. 교전 지역 복귀 시작.")
+                if info.get("_no_reload"):
+                    # 무장 고갈 편대 복귀: 재장착·재출격 없이 임무 종료
+                    completed_reload.append(uid)
+                    logger.info(f"[처리] {uid} 무장고갈 복귀 완료. 임무 종료.")
+                else:
+                    # 일반 재장착 후 복귀
+                    sim.num_left_missiles = RELOAD_MISSILES
+                    sim.num_missiles = RELOAD_MISSILES
+                    self.reloaded_returning[uid] = {
+                        "combat_lon": info["combat_lon"],
+                        "combat_lat": info["combat_lat"],
+                        "missiles": RELOAD_MISSILES,
+                    }
+                    completed_reload.append(uid)
+                    logger.info(f"[처리] {uid} 재장착 완료. 교전 지역 복귀 시작.")
 
         for uid in completed_reload:
             self.reload_pending.pop(uid, None)

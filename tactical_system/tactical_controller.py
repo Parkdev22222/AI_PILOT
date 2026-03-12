@@ -293,6 +293,7 @@ class TacticalController:
         # 이벤트 처리 완료 플래그
         self._major_loss_handled: bool = False
         self._ammo_handled_uids: set = set()
+        self._formation_ammo_handled: set = set()  # 처리 완료된 pair_idx
 
     # ------------------------------------------------------------------
     # 메인 루프
@@ -401,6 +402,43 @@ class TacticalController:
 
                 # continue: 아무 조치 없이 계속 비행
                 self._ammo_handled_uids.add(uid)
+
+        # ── 5.3 편대 단위 무장 고갈 ────────────────────────────────────
+        formation_ammo: Dict[int, int] = info.get("event_formation_ammo_depleted", {})
+        for pair_idx_str, event_id in formation_ammo.items():
+            pair_idx = int(pair_idx_str)
+            if pair_idx in self._formation_ammo_handled:
+                continue
+            pair = self.formation_pairs[pair_idx]
+            logger.info(
+                f"[이벤트 처리] formation_ammo_depleted "
+                f"pair={pair_idx} ({pair['friendly_base']['name']}) "
+                f"(event_id={event_id})"
+            )
+
+            # 교전 지역 중심 (적 편대 위치)
+            combat_lon, combat_lat = self.env._formation_centroid(
+                pair["enemy_uids"]
+            )
+
+            # 근처 미사용 기지에서 지원 편대 출격
+            support_base = _closest_friendly_base(
+                combat_lon, combat_lat,
+                exclude=self.used_friendly_bases,
+            )
+            if support_base is None:
+                # 모든 기지 사용 중 → 가장 가까운 기지 재사용
+                support_base = _closest_friendly_base(combat_lon, combat_lat)
+
+            if support_base:
+                logger.info(
+                    f"[편대 무장고갈] 지원 편대 출격: {support_base['name']} → pair {pair_idx}"
+                )
+                self.env.handle_request_support(support_base, pair_idx)
+
+            # 무장 고갈된 편대 전체 RTB
+            self.env.handle_formation_ammo_rtb(pair_idx)
+            self._formation_ammo_handled.add(pair_idx)
 
     # ------------------------------------------------------------------
     # 유틸
