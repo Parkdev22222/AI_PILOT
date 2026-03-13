@@ -554,6 +554,136 @@ class LLMCommander:
         )
         return result
 
+    def decide_on_enemy_formation_destroyed(
+        self,
+        event_id: int,
+        pair_idx: int,
+        friendly_base: str,
+        enemy_base: str,
+        alive_friendly: int,
+        other_enemy_formations: List[Dict],
+        step: int,
+        timestamp: float,
+    ) -> Dict:
+        """
+        적 편대 전멸 시 아군 편대를 인근 적 편대에 재투입할지 기지로 복귀시킬지 결정.
+
+        Parameters
+        ----------
+        event_id               : DB 이벤트 ID
+        pair_idx               : 승리한 아군 편대쌍 인덱스
+        friendly_base          : 아군 편대 기지명
+        enemy_base             : 방금 전멸시킨 적 기지명
+        alive_friendly         : 생존 아군 기체 수
+        other_enemy_formations : 다른 살아있는 적 편대 목록
+                                 [{"pair_idx": int, "enemy_base": str,
+                                   "alive_enemy": int, "lon": float, "lat": float}, …]
+        step, timestamp        : 현재 시뮬레이션 스텝 / 시각
+
+        Returns
+        -------
+        dict  예시:
+          {
+            "action": "engage" | "rtb",
+            "target_pair_idx": <int>,   # "engage" 선택 시에만 포함
+            "reasoning": "..."
+          }
+        """
+        if not other_enemy_formations:
+            result = {
+                "action": "rtb",
+                "reasoning": "교전 가능한 다른 적 편대 없음 — 기지 복귀",
+            }
+            if self.db and self.sim_id >= 0:
+                self.db.update_event_decision(event_id, result)
+                self.db.log_llm_decision(
+                    sim_id=self.sim_id,
+                    step=step,
+                    timestamp=timestamp,
+                    decision_type="enemy_formation_destroyed",
+                    input_prompt="(no other enemies)",
+                    output_decision=json.dumps(result, ensure_ascii=False),
+                    reasoning=result["reasoning"],
+                )
+            return result
+
+        f_info = FRIENDLY_BASES.get(friendly_base, {})
+        enemy_lines = "\n".join(
+            f"  - 편대{e['pair_idx']}: {e['enemy_base']} "
+            f"(잔여 {e['alive_enemy']}대, 경도 {e['lon']:.2f}°, 위도 {e['lat']:.2f}°)"
+            for e in other_enemy_formations
+        )
+
+        system_prompt = (
+            "당신은 대한민국 공군 전술 지휘관 AI입니다. "
+            "아군 편대가 담당 적 편대를 전멸시킨 상황에서 "
+            "다음 행동을 결정하십시오. "
+            "반드시 JSON 형식으로만 응답하십시오."
+        )
+        user_prompt = f"""
+전투 승리 보고:
+- 시뮬레이션 스텝: {step}
+- 승리 편대 기지: {friendly_base}
+  (위치: 경도 {f_info.get('lon', 0):.2f}°, 위도 {f_info.get('lat', 0):.2f}°)
+- 전멸시킨 적 기지: {enemy_base}
+- 현재 생존 아군 기체: {alive_friendly}대
+
+현재 교전 중인 다른 적 편대:
+{enemy_lines}
+
+판단 요청:
+아군 편대가 적 편대를 전멸시켰습니다. 두 가지 선택지 중 하나를 선택하십시오:
+  (A) "engage" — 인근 적 편대 중 하나를 선택하여 즉시 재교전
+  (B) "rtb"    — 기지로 복귀 (연료·피로도 고려)
+
+"engage" 선택 시 반드시 target_pair_idx(위 목록의 편대 번호)를 함께 지정하십시오.
+전술적 효율성(거리·잔여 적 수)과 아군 피로도를 종합 판단하십시오.
+
+다음 JSON 형식으로 응답하십시오:
+```json
+{{
+  "action": "engage" 또는 "rtb",
+  "target_pair_idx": <정수, engage 선택 시>,
+  "reasoning": "판단 근거"
+}}
+```
+"""
+        raw = self._generate(system_prompt, user_prompt)
+        logger.debug(f"[LLM enemy_formation_destroyed response]\n{raw}")
+
+        result = self._extract_json(raw)
+        valid_targets = {e["pair_idx"] for e in other_enemy_formations}
+
+        if result is None or result.get("action") not in ("engage", "rtb"):
+            logger.warning("파싱 실패 또는 invalid action. 기본값 engage(최근접) 사용.")
+            result = {
+                "action": "engage",
+                "target_pair_idx": other_enemy_formations[0]["pair_idx"],
+                "reasoning": "파싱 실패 — 최근접 적 편대 재교전",
+            }
+
+        if result["action"] == "engage":
+            target = result.get("target_pair_idx")
+            if target not in valid_targets:
+                target = other_enemy_formations[0]["pair_idx"]
+                result["target_pair_idx"] = target
+                logger.warning(
+                    f"target_pair_idx 유효하지 않음. {target}으로 대체."
+                )
+
+        if self.db and self.sim_id >= 0:
+            self.db.update_event_decision(event_id, result)
+            self.db.log_llm_decision(
+                sim_id=self.sim_id,
+                step=step,
+                timestamp=timestamp,
+                decision_type="enemy_formation_destroyed",
+                input_prompt=user_prompt,
+                output_decision=json.dumps(result, ensure_ascii=False),
+                reasoning=result.get("reasoning", ""),
+            )
+        return result
+
     def decide_on_ammo_depletion(
         self,
         event_id: int,

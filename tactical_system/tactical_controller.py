@@ -293,8 +293,9 @@ class TacticalController:
         # 이벤트 처리 완료 플래그
         self._major_loss_handled: bool = False
         self._ammo_handled_uids: set = set()
-        self._formation_ammo_handled: set = set()    # 처리 완료된 pair_idx
-        self._formation_destroyed_handled: set = set()  # 처리 완료된 pair_idx
+        self._formation_ammo_handled: set = set()        # 처리 완료된 pair_idx
+        self._formation_destroyed_handled: set = set()   # 처리 완료된 pair_idx
+        self._enemy_formation_destroyed_handled: set = set()  # 처리 완료된 pair_idx
 
     # ------------------------------------------------------------------
     # 메인 루프
@@ -490,6 +491,69 @@ class TacticalController:
 
             self._formation_destroyed_handled.add(pair_idx)
 
+        # ── 5.5 적 편대 전멸 → LLM 재배치/RTB 결정 ─────────────────────
+        enemy_destroyed: Dict[int, int] = info.get("event_enemy_formation_destroyed", {})
+        for pair_idx_str, event_id in enemy_destroyed.items():
+            pair_idx = int(pair_idx_str)
+            if pair_idx in self._enemy_formation_destroyed_handled:
+                continue
+            pair = self.formation_pairs[pair_idx]
+            logger.info(
+                f"[이벤트 처리] enemy_formation_destroyed "
+                f"pair={pair_idx} ({pair['friendly_base']['name']} → {pair['enemy_base']['name']}) "
+                f"(event_id={event_id})"
+            )
+
+            alive_friendly = sum(
+                1 for u in pair["friendly_uids"]
+                if u in self.env.agents and self.env.agents[u].is_alive
+            )
+
+            # 다른 살아있는 적 편대 목록
+            other_enemy_formations = []
+            for other_idx, other_pair in enumerate(self.formation_pairs):
+                if other_idx == pair_idx:
+                    continue
+                alive_enemies = [
+                    u for u in other_pair["enemy_uids"]
+                    if u in self.env.agents and self.env.agents[u].is_alive
+                ]
+                if not alive_enemies:
+                    continue
+                elon, elat = self.env._formation_centroid(other_pair["enemy_uids"])
+                other_enemy_formations.append({
+                    "pair_idx":   other_idx,
+                    "enemy_base": other_pair["enemy_base"]["name"],
+                    "alive_enemy": len(alive_enemies),
+                    "lon": elon,
+                    "lat": elat,
+                })
+
+            decision = self.llm.decide_on_enemy_formation_destroyed(
+                event_id=event_id,
+                pair_idx=pair_idx,
+                friendly_base=pair["friendly_base"]["name"],
+                enemy_base=pair["enemy_base"]["name"],
+                alive_friendly=alive_friendly,
+                other_enemy_formations=other_enemy_formations,
+                step=step,
+                timestamp=ts,
+            )
+            action = decision.get("action", "rtb")
+            logger.info(
+                f"LLM 결정 (pair={pair_idx}): {action} — {decision.get('reasoning', '')}"
+            )
+
+            if action == "engage" and other_enemy_formations:
+                target_pair_idx = decision.get(
+                    "target_pair_idx", other_enemy_formations[0]["pair_idx"]
+                )
+                self.env.handle_enemy_victory_engage(pair_idx, target_pair_idx)
+            else:
+                self.env.handle_enemy_victory_rtb(pair_idx)
+
+            self._enemy_formation_destroyed_handled.add(pair_idx)
+
     # ------------------------------------------------------------------
     # 유틸
     # ------------------------------------------------------------------
@@ -506,15 +570,15 @@ class TacticalController:
         # 모든 기체 done
         if hasattr(dones, "all") and dones.all():
             return True
-        # 모든 편대쌍이 rtb_loss 또는 done
+        # 모든 편대쌍이 rtb_loss / rtb_victory / done
         all_terminal = all(
-            p in ("rtb_loss", "done")
+            p in ("rtb_loss", "rtb_victory", "done")
             for p in self.env.pair_phases.values()
         )
         if all_terminal:
             # RTB 완료 체크: 잔존 기체들이 기지에 근접했는지
             for i, pair in enumerate(self.formation_pairs):
-                if self.env.pair_phases[i] != "rtb_loss":
+                if self.env.pair_phases[i] not in ("rtb_loss", "rtb_victory"):
                     continue
                 for uid in pair["friendly_uids"]:
                     if uid not in self.env.agents:

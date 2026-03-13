@@ -331,6 +331,8 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_formation_ammo_depleted: Dict[int, int] = {}
         # 아군 편대 전멸: pair_idx → event_id
         self.event_formation_destroyed: Dict[int, int] = {}
+        # 적 편대 전멸(아군 승리): pair_idx → event_id
+        self.event_enemy_formation_destroyed: Dict[int, int] = {}
 
         # 스폰 일련번호 (중복 UID 방지)
         self._spawn_counter: int = 0
@@ -390,6 +392,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_ammo_depleted_ids.clear()
         self.event_formation_ammo_depleted.clear()
         self.event_formation_destroyed.clear()
+        self.event_enemy_formation_destroyed.clear()
         self._spawn_counter = 0
         self._victory_reassigned.clear()
         self.reload_pending.clear()
@@ -445,6 +448,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         info["event_ammo_depleted_ids"] = dict(self.event_ammo_depleted_ids)
         info["event_formation_ammo_depleted"] = dict(self.event_formation_ammo_depleted)
         info["event_formation_destroyed"] = dict(self.event_formation_destroyed)
+        info["event_enemy_formation_destroyed"] = dict(self.event_enemy_formation_destroyed)
 
         return obs, share_obs, rewards, dones, info
 
@@ -710,7 +714,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
 
     def _update_pair_phases(self):
         for i, pair in enumerate(self.formation_pairs):
-            if self.pair_phases[i] in ("done", "rtb_loss"):
+            if self.pair_phases[i] in ("done", "rtb_loss", "rtb_victory"):
                 continue
             friendly_uids = pair["friendly_uids"]
             enemy_uids    = pair["enemy_uids"]
@@ -784,7 +788,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         for i, pair in enumerate(self.formation_pairs):
             if i in self.event_formation_ammo_depleted:
                 continue
-            if self.pair_phases[i] in ("rtb_loss", "rtb_ammo", "done"):
+            if self.pair_phases[i] in ("rtb_loss", "rtb_ammo", "done", "rtb_victory"):
                 continue
             alive_uids = [
                 u for u in pair["friendly_uids"]
@@ -814,6 +818,42 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     f"[이벤트] 편대 {i} ({pair['friendly_base']['name']}) "
                     f"전 기체 무장 고갈 (event_id={event_id})"
                 )
+
+        # ── 적 편대 전멸 (아군 승리) ────────────────────────────────────
+        # enemy_uids 전원 사망, 아군 생존 기체 존재 → enemy_formation_destroyed 이벤트
+        for i, pair in enumerate(self.formation_pairs):
+            if i in self.event_enemy_formation_destroyed:
+                continue
+            if self.pair_phases[i] in ("rtb_loss", "rtb_ammo", "done", "rtb_victory"):
+                continue
+            alive_friendly = [
+                u for u in pair["friendly_uids"]
+                if u in self.agents and self.agents[u].is_alive
+            ]
+            if not alive_friendly:
+                continue  # 아군도 없음 → formation_destroyed 쪽에서 처리
+            alive_enemy = [
+                u for u in pair["enemy_uids"]
+                if u in self.agents and self.agents[u].is_alive
+            ]
+            if alive_enemy:
+                continue  # 아직 적 생존
+            details = {
+                "pair_idx": i,
+                "friendly_base": pair["friendly_base"]["name"],
+                "enemy_base": pair["enemy_base"]["name"],
+                "alive_friendly": len(alive_friendly),
+                "friendly_uids": alive_friendly,
+                "step": step,
+            }
+            event_id = self.db.log_event(
+                self.sim_id, step, ts, "enemy_formation_destroyed", details
+            )
+            self.event_enemy_formation_destroyed[i] = event_id
+            logger.info(
+                f"[이벤트] 적 편대 {i} ({pair['enemy_base']['name']}) 전멸 — "
+                f"아군 {len(alive_friendly)}대 생존 (event_id={event_id})"
+            )
 
         # ── 아군 편대 전멸 ─────────────────────────────────────────────
         # friendly_uids 전원 사망 → formation_destroyed 이벤트
@@ -1013,6 +1053,72 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
             f"(기지: {replacement_base['name']}, pair={pair_idx})"
         )
 
+    def handle_enemy_victory_engage(self, pair_idx: int, target_pair_idx: int):
+        """
+        적 편대 전멸 후 아군 편대를 다른 적 편대 방향으로 재배치.
+
+        Parameters
+        ----------
+        pair_idx        : 승리한 아군 편대쌍 인덱스
+        target_pair_idx : 새로 교전할 적 편대쌍 인덱스
+        """
+        pair        = self.formation_pairs[pair_idx]
+        target_pair = self.formation_pairs[target_pair_idx]
+
+        alive_target_enemies = [
+            u for u in target_pair["enemy_uids"]
+            if u in self.agents and self.agents[u].is_alive
+        ]
+
+        for uid in pair["friendly_uids"]:
+            if uid not in self.agents or not self.agents[uid].is_alive:
+                continue
+            sim = self.agents[uid]
+            # 죽은 적기 제거 후 새 적기 연결
+            sim.enemies = [e for e in sim.enemies if e.is_alive]
+            for eu in alive_target_enemies:
+                enemy_sim = self.agents[eu]
+                if enemy_sim not in sim.enemies:
+                    sim.enemies.append(enemy_sim)
+                if sim not in enemy_sim.enemies:
+                    enemy_sim.enemies.append(sim)
+
+        # pair의 enemy_uids를 타겟 편대의 것으로 업데이트
+        pair["enemy_uids"] = list(target_pair["enemy_uids"])
+        self.pair_phases[pair_idx] = "approach"
+        logger.info(
+            f"[처리] 편대{pair_idx} 승리 재배치: "
+            f"{pair['friendly_base']['name']} → 적편대{target_pair_idx} "
+            f"({target_pair['enemy_base']['name']}) 공격"
+        )
+
+    def handle_enemy_victory_rtb(self, pair_idx: int):
+        """
+        적 편대 전멸 후 아군 편대 기지 복귀.
+
+        Parameters
+        ----------
+        pair_idx : 승리한 아군 편대쌍 인덱스
+        """
+        pair = self.formation_pairs[pair_idx]
+        home = pair["friendly_base"]
+        for uid in pair["friendly_uids"]:
+            if uid not in self.agents or not self.agents[uid].is_alive:
+                continue
+            if uid in self.reload_pending or uid in self.reloaded_returning:
+                continue
+            self.reload_pending[uid] = {
+                "home_lon":   home["lon"],
+                "home_lat":   home["lat"],
+                "combat_lon": home["lon"],
+                "combat_lat": home["lat"],
+                "_no_reload": True,
+            }
+        self.pair_phases[pair_idx] = "rtb_victory"
+        logger.info(
+            f"[처리] 편대{pair_idx} 승리 RTB: {home['name']}으로 복귀"
+        )
+
     def handle_ammo_rtb(self, uid: str):
         """
         무장 고갈 기체 RTB → 기지 귀환 후 AIM-9L 5발 재장착 → 복귀 시작.
@@ -1185,7 +1291,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         for i, pair in enumerate(self.formation_pairs):
             if i in self._victory_reassigned:
                 continue
-            if self.pair_phases.get(i) in ("rtb_loss", "rtb_ammo", "done"):
+            if self.pair_phases.get(i) in ("rtb_loss", "rtb_ammo", "done", "rtb_victory"):
                 continue
 
             # pair i 의 담당 적기 중 생존자 확인

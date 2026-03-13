@@ -67,8 +67,9 @@ _PHASE_KO = {
 }
 
 _EVENT_TYPE_KO = {
-    "major_loss":     "전력 50% 손실",
-    "ammo_depleted":  "무장 고갈",
+    "major_loss":               "전력 50% 손실",
+    "ammo_depleted":            "무장 고갈",
+    "enemy_formation_destroyed": "적 편대 전멸",
 }
 
 
@@ -681,12 +682,13 @@ class TacticalDashboard:
 
     # LLM 판단 유형 한글명
     _LLM_DECISION_TYPE_KO = {
-        "dispatch":              "초기 출격 결정",
-        "formation_assignment":  "편대 배정",
-        "major_loss":            "전력 50% 손실 대응",
-        "ammo_depleted":         "무장 고갈 대응",
-        "formation_ammo_depleted": "편대 무장 고갈 대응",
-        "formation_destroyed":   "편대 전멸 교체 결정",
+        "dispatch":                   "초기 출격 결정",
+        "formation_assignment":       "편대 배정",
+        "major_loss":                 "전력 50% 손실 대응",
+        "ammo_depleted":              "무장 고갈 대응",
+        "formation_ammo_depleted":    "편대 무장 고갈 대응",
+        "formation_destroyed":        "편대 전멸 교체 결정",
+        "enemy_formation_destroyed":  "적 전멸 후 재배치 결정",
     }
 
     def _make_event_rows(self) -> str:
@@ -718,6 +720,13 @@ class TacticalDashboard:
                     )
                 elif "aircraft_uid" in details:
                     detail_str = f"{_html.escape(str(details['aircraft_uid']))} 무장 고갈"
+                elif "friendly_base" in details and "alive_friendly" in details and "enemy_base" in details and "alive_enemy" not in details:
+                    # enemy_formation_destroyed 이벤트
+                    detail_str = (
+                        f"🏆 {_html.escape(str(details.get('friendly_base','?')))} 편대 "
+                        f"→ {_html.escape(str(details.get('enemy_base','?')))} 전멸 "
+                        f"(아군 {details.get('alive_friendly','?')}대 생존)"
+                    )
                 elif "friendly_base" in details and "alive_enemy" in details:
                     detail_str = (
                         f"{_html.escape(str(details.get('friendly_base','?')))} 편대 "
@@ -740,7 +749,12 @@ class TacticalDashboard:
                 if e.get("resolved")
                 else "<span class='badge-wait'>대기</span>"
             )
-            type_class = "event-loss" if "손실" in etype or "전멸" in etype else "event-ammo"
+            if "손실" in etype or ("전멸" in etype and "적" not in etype):
+                type_class = "event-loss"
+            elif "적 편대 전멸" in etype:
+                type_class = "status-alive"   # 승리 → 초록색
+            else:
+                type_class = "event-ammo"
 
             rows.append({
                 "step": e.get("step", 0),
@@ -783,6 +797,13 @@ class TacticalDashboard:
             elif dtype == "formation_destroyed":
                 chosen = _html.escape(str(out.get("base", "-")))
                 detail_str = f"교체 기지: {chosen}"
+            elif dtype == "enemy_formation_destroyed":
+                action = out.get("action", "")
+                if action == "engage":
+                    target = _html.escape(str(out.get("target_pair_idx", "-")))
+                    detail_str = f"재교전 → 적편대{target}"
+                else:
+                    detail_str = "기지 복귀 명령"
             else:
                 detail_str = "-"
 
@@ -792,6 +813,7 @@ class TacticalDashboard:
                 "rtb":             "RTB 명령",
                 "request_support": "지원 요청",
                 "continue":        "임무 지속",
+                "engage":          "재교전 명령",
             }.get(action, "")
             if not action_ko:
                 # dispatch / assignment 등은 detail에 이미 표현됨
