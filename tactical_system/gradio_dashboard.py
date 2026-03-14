@@ -1348,6 +1348,8 @@ class TacticalDashboard:
           font-weight:700 !important; padding:8px 20px !important;
           cursor:pointer !important;
         }
+        /* 기지 목록 행 hover */
+        #base-list-html div[onclick]:hover { opacity: 0.85 !important; }
         """
 
         init_js = """
@@ -1578,51 +1580,42 @@ class TacticalDashboard:
                 with gr.Column(elem_id="scenario-modal-inner"):
                     gr.HTML("<div class='scenario-title'>🗺 시나리오 설정</div>")
 
-                    enemy_base_cb = gr.CheckboxGroup(
-                        choices=list(ENEMY_BASES.keys()),
-                        value=list(ENEMY_BASES.keys())[:1],
-                        label="적군 출격 기지 (복수 선택 가능)",
+                    # 기지 목록 (커스텀 HTML, Svelte 렌더 버그 회피)
+                    gr.HTML("<div class='modal-section-label'>🛫 적군 출격 기지</div>")
+                    _init_bases = {
+                        name: {"selected": i == 0, "target_lon": None, "target_lat": None, "target_name": "미설정"}
+                        for i, name in enumerate(ENEMY_BASES.keys())
+                    }
+                    _first_base = list(ENEMY_BASES.keys())[0]
+                    base_list_html = gr.HTML(
+                        value=self._render_base_list_html(_init_bases, _first_base),
+                        elem_id="base-list-html",
+                    )
+                    # JS→Python 브릿지 (기지 선택/토글)
+                    base_action_tb = gr.Textbox(
+                        value="", label="", show_label=False,
+                        elem_id="base-action-tb",
+                        elem_classes=["modal-click-hidden"],
                     )
 
-                    gr.HTML(
-                        "<div class='modal-section-label'>"
-                        "📍 공격 목표 지점 — 지도를 클릭하여 선택"
-                        "</div>"
+                    # 지도 섹션
+                    current_base_label = gr.HTML(
+                        value=f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{_first_base}</b></div>",
+                        elem_id="current-base-label",
                     )
-                    # gr.HTML 로 지도 표시 — visible=False 컨테이너 안에서도
-                    # base64 img 는 항상 렌더링됨 (gr.Image 의 Svelte 렌더 버그 회피)
-                    # onclick JS 가 좌표 계산 후 숨겨진 Textbox 에 "lon,lat" 기록
                     modal_map_html = gr.HTML(
-                        value=self._render_modal_map_html(),
+                        value=self._render_modal_map_html(_init_bases, _first_base),
                         elem_id="modal-map-html",
                     )
-                    # JS → Python 브릿지: DOM 에 존재하되 화면 밖에 위치
                     click_tb = gr.Textbox(
-                        value="",
-                        label="",
-                        show_label=False,
+                        value="", label="", show_label=False,
                         elem_id="modal-map-click-tb",
                         elem_classes=["modal-click-hidden"],
                     )
 
-                    # 미리 정의된 목표 선택 (라디오)
-                    _preset_names = [k for k in ATTACK_TARGETS if k != "직접 입력"]
-                    attack_target_radio = gr.Radio(
-                        choices=_preset_names,
-                        value=None,
-                        label="또는 미리 정의된 목표 선택",
-                    )
-
-                    # 현재 선택된 목표 좌표 표시
-                    target_info_label = gr.HTML(
-                        "<div class='target-coord-box'>"
-                        "📍 목표 미설정 — 지도를 클릭하거나 위 목록에서 선택"
-                        "</div>"
-                    )
-
-                    # 선택된 좌표 상태 (map click 또는 radio로 설정)
-                    modal_target_lon = gr.State(None)
-                    modal_target_lat = gr.State(None)
+                    # 상태
+                    bases_state = gr.State(_init_bases)
+                    active_base_state = gr.State(_first_base)
 
                     with gr.Row():
                         confirm_btn = gr.Button(
@@ -1653,72 +1646,6 @@ class TacticalDashboard:
 
             # ── 시나리오 버튼 콜백 ────────────────────────────────────────
 
-            # 모달 열기: 지도 HTML 초기 렌더링 (마커 없음), click_tb 초기화
-            def _on_open_scenario():
-                html = self._render_modal_map_html()
-                return gr.update(visible=True), html, ""
-
-            scenario_btn.click(
-                fn=_on_open_scenario,
-                inputs=[],
-                outputs=[scenario_modal, modal_map_html, click_tb],
-            )
-
-            cancel_btn.click(
-                fn=lambda: gr.update(visible=False),
-                inputs=[],
-                outputs=[scenario_modal],
-            )
-
-            # JS onclick → click_tb 에 "lon,lat" 기록 → .input() 이벤트 → 여기서 처리
-            def _on_click_tb_input(coords_str):
-                if not coords_str or "," not in coords_str:
-                    return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                try:
-                    lon, lat = (float(v) for v in coords_str.split(",", 1))
-                except ValueError:
-                    return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                html = self._render_modal_map_html(marker_lon=lon, marker_lat=lat)
-                info_html = (
-                    f"<div class='target-coord-box'>"
-                    f"📍 직접 선택: <b>{lon:.3f}°E, {lat:.3f}°N</b>"
-                    f"</div>"
-                )
-                return html, None, info_html, lon, lat
-
-            click_tb.input(
-                fn=_on_click_tb_input,
-                inputs=[click_tb],
-                outputs=[modal_map_html, attack_target_radio, target_info_label,
-                         modal_target_lon, modal_target_lat],
-            )
-
-            # 미리 정의된 목표 선택 → 지도 HTML 마커 이동 + 좌표 업데이트
-            def _on_preset_select(target_name):
-                coords = ATTACK_TARGETS.get(target_name) if target_name else None
-                if not coords:
-                    html = self._render_modal_map_html()
-                    info_html = (
-                        "<div class='target-coord-box'>"
-                        "📍 목표 미설정 — 지도를 클릭하거나 위 목록에서 선택"
-                        "</div>"
-                    )
-                    return html, info_html, None, None
-                lon, lat = coords
-                html = self._render_modal_map_html(marker_lon=lon, marker_lat=lat)
-                info_html = (
-                    f"<div class='target-coord-box'>"
-                    f"🎯 {target_name}: <b>{lon:.3f}°E, {lat:.3f}°N</b>"
-                    f"</div>"
-                )
-                return html, info_html, float(lon), float(lat)
-
-            attack_target_radio.change(
-                fn=_on_preset_select,
-                inputs=[attack_target_radio],
-                outputs=[modal_map_html, target_info_label, modal_target_lon, modal_target_lat],
-            )
-
             def _start_sim_thread(scenario: dict):
                 """시뮬레이션 스레드 시작 (중복 방지)."""
                 if not self._sim_started:
@@ -1733,42 +1660,117 @@ class TacticalDashboard:
                         )
                         t.start()
 
-            def _on_confirm_and_start(bases, target_name, tgt_lon, tgt_lat):
-                """시나리오 확인 + 시뮬레이션 즉시 시작."""
-                valid_bases = [b for b in (bases or []) if b in ENEMY_BASES]
-                if not valid_bases:
-                    valid_bases = list(ENEMY_BASES.keys())[:1]
-
-                # 우선순위: 지도 직접 클릭 > 라디오 프리셋 > 없음
-                if tgt_lon is not None and tgt_lat is not None:
-                    coords = (float(tgt_lon), float(tgt_lat))
-                    tgt_display = f"직접 선택 ({tgt_lon:.3f}°E, {tgt_lat:.3f}°N)"
-                elif target_name and target_name in ATTACK_TARGETS:
-                    coords = ATTACK_TARGETS[target_name]
-                    tgt_display = (
-                        f"{target_name} ({coords[0]:.3f}°E, {coords[1]:.3f}°N)"
-                        if coords else "없음"
-                    )
-                else:
-                    coords = None
-                    tgt_display = "없음"
-
-                scenario = {
-                    "enemy_bases": valid_bases,
-                    "attack_target": coords,
-                    "attack_target_name": tgt_display,
+            # 모달 열기
+            def _on_open_scenario():
+                init_bases = {
+                    name: {"selected": i == 0, "target_lon": None, "target_lat": None, "target_name": "미설정"}
+                    for i, name in enumerate(ENEMY_BASES.keys())
                 }
-
-                bases_str = ", ".join(valid_bases)
-                label_html = (
-                    f"<div class='scenario-label-box'>"
-                    f"🗺 <b>적 기지:</b> {bases_str}<br>"
-                    f"🎯 <b>공격 목표:</b> {tgt_display}"
-                    f"</div>"
+                first_base = list(ENEMY_BASES.keys())[0]
+                map_html = self._render_modal_map_html(init_bases, first_base)
+                base_list = self._render_base_list_html(init_bases, first_base)
+                cur_lbl = f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{first_base}</b></div>"
+                return (
+                    gr.update(visible=True),  # scenario_modal
+                    base_list,                 # base_list_html
+                    map_html,                  # modal_map_html
+                    cur_lbl,                   # current_base_label
+                    "",                        # click_tb
+                    "",                        # base_action_tb
+                    init_bases,                # bases_state
+                    first_base,                # active_base_state
                 )
 
-                _start_sim_thread(scenario)
+            scenario_btn.click(
+                fn=_on_open_scenario,
+                inputs=[],
+                outputs=[scenario_modal, base_list_html, modal_map_html, current_base_label,
+                         click_tb, base_action_tb, bases_state, active_base_state],
+            )
 
+            cancel_btn.click(fn=lambda: gr.update(visible=False), inputs=[], outputs=[scenario_modal])
+
+            # 기지 선택/토글 (base_action_tb.input)
+            def _on_base_action(action_str, bases_data, active_base):
+                if not action_str or ":" not in action_str:
+                    return gr.update(), gr.update(), gr.update(), bases_data, active_base, ""
+                import copy
+                bd = copy.deepcopy(bases_data)
+                action, base_name = action_str.split(":", 1)
+                if base_name not in bd:
+                    return gr.update(), gr.update(), gr.update(), bd, active_base, ""
+                if action == "toggle":
+                    bd[base_name]["selected"] = not bd[base_name].get("selected", False)
+                elif action == "select":
+                    active_base = base_name
+                    bd[base_name]["selected"] = True
+                map_html = self._render_modal_map_html(bd, active_base)
+                base_list = self._render_base_list_html(bd, active_base)
+                cur_lbl = f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{active_base}</b></div>"
+                return map_html, base_list, cur_lbl, bd, active_base, ""
+
+            base_action_tb.input(
+                fn=_on_base_action,
+                inputs=[base_action_tb, bases_state, active_base_state],
+                outputs=[modal_map_html, base_list_html, current_base_label,
+                         bases_state, active_base_state, base_action_tb],
+            )
+
+            # 지도 클릭 (click_tb.input) → 현재 활성 기지의 목표 설정
+            def _on_click_tb_input(coords_str, bases_data, active_base):
+                if not coords_str or "," not in coords_str:
+                    return gr.update(), gr.update(), gr.update(), bases_data, ""
+                import copy
+                try:
+                    lon, lat = (float(v) for v in coords_str.split(",", 1))
+                except ValueError:
+                    return gr.update(), gr.update(), gr.update(), bases_data, ""
+                bd = copy.deepcopy(bases_data)
+                if active_base and active_base in bd:
+                    bd[active_base]["target_lon"] = lon
+                    bd[active_base]["target_lat"] = lat
+                    bd[active_base]["target_name"] = "직접 선택"
+                map_html = self._render_modal_map_html(bd, active_base)
+                base_list = self._render_base_list_html(bd, active_base)
+                cur_lbl = f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{active_base}</b></div>"
+                return map_html, base_list, cur_lbl, bd, ""
+
+            click_tb.input(
+                fn=_on_click_tb_input,
+                inputs=[click_tb, bases_state, active_base_state],
+                outputs=[modal_map_html, base_list_html, current_base_label, bases_state, click_tb],
+            )
+
+            # 시나리오 확인
+            def _on_confirm_and_start(bases_data):
+                selected = [n for n, d in bases_data.items() if d.get("selected")]
+                if not selected:
+                    selected = list(ENEMY_BASES.keys())[:1]
+                attack_targets = {}
+                for name in selected:
+                    d = bases_data[name]
+                    if d.get("target_lon") is not None:
+                        attack_targets[name] = (d["target_lon"], d["target_lat"])
+                    else:
+                        attack_targets[name] = None
+                first_target = next((v for v in attack_targets.values() if v), None)
+                scenario = {
+                    "enemy_bases": selected,
+                    "attack_target": first_target,
+                    "attack_targets": attack_targets,
+                }
+                bases_str = ", ".join(selected)
+                tgt_lines = "".join(
+                    f"<br>• {n}: {f'{v[0]:.3f}°E {v[1]:.3f}°N' if v else '미설정'}"
+                    for n, v in attack_targets.items()
+                )
+                label_html = (
+                    f"<div class='scenario-label-box'>"
+                    f"🛫 <b>적 기지:</b> {bases_str}"
+                    f"{tgt_lines}"
+                    f"</div>"
+                )
+                _start_sim_thread(scenario)
                 return (
                     scenario,
                     gr.update(visible=False),
@@ -1778,7 +1780,7 @@ class TacticalDashboard:
 
             confirm_btn.click(
                 fn=_on_confirm_and_start,
-                inputs=[enemy_base_cb, attack_target_radio, modal_target_lon, modal_target_lat],
+                inputs=[bases_state],
                 outputs=[scenario_state, scenario_modal, scenario_label, start_btn],
             )
 
