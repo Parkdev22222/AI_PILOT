@@ -137,6 +137,9 @@ class TacticalDashboard:
         self.refresh_interval = refresh_interval
         self.start_callback = start_callback
         self._sim_started = False
+        # 모달 지도 좌표 변환용: tight_layout 후 axes 위치 (figure fraction)
+        self._map_axes_frac: Tuple[float, float, float, float] = (0.12, 0.10, 0.96, 0.94)
+        self._modal_img_wh: Tuple[int, int] = (630, 540)  # dpi=90, figsize=(7,6)
 
     def _get_sim_id(self) -> Optional[int]:
         """명시 sim_id가 있으면 그것을, 없으면 DB에서 최신 sim_id를 반환."""
@@ -409,6 +412,8 @@ class TacticalDashboard:
         )
 
         fig.tight_layout(pad=0.5)
+        # axes 위치를 저장 (모달 지도 클릭 좌표 변환에 사용)
+        self._map_axes_frac = tuple(ax.get_position().extents)  # (x0, y0, x1, y1)
         return fig
 
     def _render_map_b64(self) -> str:
@@ -420,6 +425,72 @@ class TacticalDashboard:
         plt.close(fig)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode()
+
+    def _render_modal_map(
+        self,
+        marker_lon: Optional[float] = None,
+        marker_lat: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        시나리오 모달용 지도를 numpy RGB 배열로 렌더링.
+        marker_lon/lat 가 주어지면 황색 ★ 마커를 표시.
+        bbox_inches='tight' 없이 저장 → 정확히 figsize*dpi 픽셀 (630×540).
+        """
+        fig = self._make_map_figure()   # self._map_axes_frac 도 갱신됨
+        ax = fig.axes[0]
+
+        if marker_lon is not None and marker_lat is not None:
+            ax.plot(
+                marker_lon, marker_lat, "*",
+                color="#f9e2af", markersize=22,
+                markeredgecolor="#1e1e2e", markeredgewidth=1.5,
+                zorder=15,
+            )
+            # 십자선 보조 마커
+            ax.plot(
+                marker_lon, marker_lat, "+",
+                color="white", markersize=16,
+                markeredgewidth=2.0, zorder=16,
+            )
+
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        self._modal_img_wh = (w, h)
+        img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+        img_rgb = img[:, :, :3].copy()
+        plt.close(fig)
+        return img_rgb
+
+    def _px_to_lonlat(
+        self, px: int, py: int
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        모달 지도 이미지 픽셀 좌표 (px, py) → 위경도 변환.
+        ax.get_position() 으로 저장된 axes fraction 을 사용.
+        반환: (lon, lat) 또는 (None, None) — 축 영역 바깥 클릭 시
+        """
+        x0, y0, x1, y1 = self._map_axes_frac   # matplotlib fraction
+        w, h = self._modal_img_wh
+
+        fx = px / w         # [0,1]
+        fy = py / h         # [0,1], 0=top
+
+        # matplotlib: y0=하단, y1=상단 (fraction)
+        # 이미지 좌표계에서: axes 상단 = 1-y1, axes 하단 = 1-y0
+        ax_top = 1.0 - y1
+        ax_bot = 1.0 - y0
+
+        if not (x0 <= fx <= x1 and ax_top <= fy <= ax_bot):
+            return None, None
+
+        t = (fx - x0)     / (x1 - x0)       # 0=LON_MIN, 1=LON_MAX
+        s = (fy - ax_top) / (ax_bot - ax_top)  # 0=LAT_MAX, 1=LAT_MIN
+
+        LON_MIN, LON_MAX = 124.0, 131.0
+        LAT_MIN, LAT_MAX = 34.5, 43.0
+        lon = LON_MIN + t * (LON_MAX - LON_MIN)
+        lat = LAT_MAX - s * (LAT_MAX - LAT_MIN)
+        return round(lon, 4), round(lat, 4)
 
     def _make_map_carrier(self) -> str:
         """타이머 갱신용: base64 데이터만 숨겨진 span 에 담아 전달.
@@ -1087,11 +1158,29 @@ class TacticalDashboard:
           background: #2a2a3e !important;
           border: 2px solid #89b4fa !important;
           border-radius: 14px !important;
-          padding: 28px 32px !important;
-          min-width: 480px !important; max-width: 640px !important;
+          padding: 24px 28px !important;
+          min-width: 680px !important; max-width: 860px !important;
           box-shadow: 0 16px 48px rgba(0,0,0,0.8) !important;
-          max-height: 85vh !important; overflow-y: auto !important;
+          max-height: 90vh !important; overflow-y: auto !important;
         }
+        /* 모달 섹션 구분 라벨 */
+        .modal-section-label {
+          font-size: 0.88rem; font-weight: 700;
+          color: #89b4fa; margin: 10px 0 4px 0;
+        }
+        /* 선택된 목표 좌표 표시 박스 */
+        .target-coord-box {
+          background: #313244; border: 1px solid #89b4fa;
+          border-radius: 6px; padding: 7px 12px;
+          font-size: 0.85rem; color: #f9e2af;
+          margin: 6px 0; text-align: center;
+        }
+        /* 모달 지도 이미지 — 클릭 커서 */
+        #modal-map-img img,
+        #modal-map-img .svelte-1pijsyv { cursor: crosshair !important; }
+        /* Gradio Image 업로드 버튼 숨김 (클릭 전용 모드) */
+        #modal-map-img .upload-container,
+        #modal-map-img .source-selection { display: none !important; }
         .scenario-title {
           font-size:1.1rem; font-weight:700;
           color:#89b4fa; margin-bottom:16px;
@@ -1350,21 +1439,40 @@ class TacticalDashboard:
                         label="적군 출격 기지 (복수 선택 가능)",
                     )
 
-                    attack_target_radio = gr.Radio(
-                        choices=list(ATTACK_TARGETS.keys()),
-                        value=list(ATTACK_TARGETS.keys())[0],
-                        label="공격 목표 지점",
+                    gr.HTML(
+                        "<div class='modal-section-label'>"
+                        "📍 공격 목표 지점 — 지도를 클릭하여 선택"
+                        "</div>"
+                    )
+                    # 클릭 가능한 지도 이미지
+                    modal_map = gr.Image(
+                        value=None,
+                        type="numpy",
+                        interactive=True,
+                        height=380,
+                        show_label=False,
+                        show_download_button=False,
+                        elem_id="modal-map-img",
                     )
 
-                    with gr.Row(visible=False) as custom_coord_row:
-                        custom_lon = gr.Number(
-                            label="목표 경도 (°E)", value=127.0,
-                            minimum=124.0, maximum=132.0, precision=4,
-                        )
-                        custom_lat = gr.Number(
-                            label="목표 위도 (°N)", value=37.5,
-                            minimum=33.0, maximum=43.0, precision=4,
-                        )
+                    # 미리 정의된 목표 선택 (라디오)
+                    _preset_names = [k for k in ATTACK_TARGETS if k != "직접 입력"]
+                    attack_target_radio = gr.Radio(
+                        choices=_preset_names,
+                        value=None,
+                        label="또는 미리 정의된 목표 선택",
+                    )
+
+                    # 현재 선택된 목표 좌표 표시
+                    target_info_label = gr.HTML(
+                        "<div class='target-coord-box'>"
+                        "📍 목표 미설정 — 지도를 클릭하거나 위 목록에서 선택"
+                        "</div>"
+                    )
+
+                    # 선택된 좌표 상태 (map click 또는 radio로 설정)
+                    modal_target_lon = gr.State(None)
+                    modal_target_lat = gr.State(None)
 
                     with gr.Row():
                         confirm_btn = gr.Button(
@@ -1394,10 +1502,15 @@ class TacticalDashboard:
             )
 
             # ── 시나리오 버튼 콜백 ────────────────────────────────────────
+
+            # 모달 열기: 지도 초기 렌더링 (마커 없음)
+            def _on_open_scenario():
+                return gr.update(visible=True), self._render_modal_map()
+
             scenario_btn.click(
-                fn=lambda: gr.update(visible=True),
+                fn=_on_open_scenario,
                 inputs=[],
-                outputs=[scenario_modal],
+                outputs=[scenario_modal, modal_map],
             )
 
             cancel_btn.click(
@@ -1406,13 +1519,50 @@ class TacticalDashboard:
                 outputs=[scenario_modal],
             )
 
-            def _on_target_change(target_name):
-                return gr.update(visible=(target_name == "직접 입력"))
+            # 지도 클릭 → 픽셀 좌표를 위경도로 변환 후 마커 표시
+            def _on_map_click(evt: gr.SelectData):
+                px, py = evt.index
+                lon, lat = self._px_to_lonlat(px, py)
+                if lon is None:
+                    return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                img = self._render_modal_map(marker_lon=lon, marker_lat=lat)
+                info_html = (
+                    f"<div class='target-coord-box'>"
+                    f"📍 직접 선택: <b>{lon:.3f}°E, {lat:.3f}°N</b>"
+                    f"</div>"
+                )
+                return img, None, info_html, float(lon), float(lat)
+
+            modal_map.select(
+                fn=_on_map_click,
+                outputs=[modal_map, attack_target_radio, target_info_label,
+                         modal_target_lon, modal_target_lat],
+            )
+
+            # 미리 정의된 목표 선택 → 마커 이동 + 좌표 업데이트
+            def _on_preset_select(target_name):
+                coords = ATTACK_TARGETS.get(target_name) if target_name else None
+                if not coords:
+                    img = self._render_modal_map()
+                    info_html = (
+                        "<div class='target-coord-box'>"
+                        "📍 목표 미설정 — 지도를 클릭하거나 위 목록에서 선택"
+                        "</div>"
+                    )
+                    return img, info_html, None, None
+                lon, lat = coords
+                img = self._render_modal_map(marker_lon=lon, marker_lat=lat)
+                info_html = (
+                    f"<div class='target-coord-box'>"
+                    f"🎯 {target_name}: <b>{lon:.3f}°E, {lat:.3f}°N</b>"
+                    f"</div>"
+                )
+                return img, info_html, float(lon), float(lat)
 
             attack_target_radio.change(
-                fn=_on_target_change,
+                fn=_on_preset_select,
                 inputs=[attack_target_radio],
-                outputs=[custom_coord_row],
+                outputs=[modal_map, target_info_label, modal_target_lon, modal_target_lat],
             )
 
             def _start_sim_thread(scenario: dict):
@@ -1429,51 +1579,52 @@ class TacticalDashboard:
                         )
                         t.start()
 
-            def _on_confirm_and_start(bases, target_name, lon, lat):
+            def _on_confirm_and_start(bases, target_name, tgt_lon, tgt_lat):
                 """시나리오 확인 + 시뮬레이션 즉시 시작."""
-                # 기지 선택 검증
                 valid_bases = [b for b in (bases or []) if b in ENEMY_BASES]
                 if not valid_bases:
                     valid_bases = list(ENEMY_BASES.keys())[:1]
 
-                # 공격 목표 좌표 결정
-                if target_name == "직접 입력":
-                    coords = (float(lon), float(lat))
+                # 우선순위: 지도 직접 클릭 > 라디오 프리셋 > 없음
+                if tgt_lon is not None and tgt_lat is not None:
+                    coords = (float(tgt_lon), float(tgt_lat))
+                    tgt_display = f"직접 선택 ({tgt_lon:.3f}°E, {tgt_lat:.3f}°N)"
+                elif target_name and target_name in ATTACK_TARGETS:
+                    coords = ATTACK_TARGETS[target_name]
+                    tgt_display = (
+                        f"{target_name} ({coords[0]:.3f}°E, {coords[1]:.3f}°N)"
+                        if coords else "없음"
+                    )
                 else:
-                    coords = ATTACK_TARGETS.get(target_name)
+                    coords = None
+                    tgt_display = "없음"
 
                 scenario = {
                     "enemy_bases": valid_bases,
                     "attack_target": coords,
-                    "attack_target_name": target_name,
+                    "attack_target_name": tgt_display,
                 }
 
-                # 라벨 갱신
                 bases_str = ", ".join(valid_bases)
-                tgt_str = (
-                    f"{target_name} ({coords[0]:.3f}°E, {coords[1]:.3f}°N)"
-                    if coords else "없음"
-                )
                 label_html = (
                     f"<div class='scenario-label-box'>"
                     f"🗺 <b>적 기지:</b> {bases_str}<br>"
-                    f"🎯 <b>공격 목표:</b> {tgt_str}"
+                    f"🎯 <b>공격 목표:</b> {tgt_display}"
                     f"</div>"
                 )
 
-                # 시뮬레이션 스레드 시작
                 _start_sim_thread(scenario)
 
                 return (
-                    scenario,                                                        # scenario_state
-                    gr.update(visible=False),                                        # scenario_modal 닫기
-                    label_html,                                                      # scenario_label
-                    gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False),  # start_btn
+                    scenario,
+                    gr.update(visible=False),
+                    label_html,
+                    gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False),
                 )
 
             confirm_btn.click(
                 fn=_on_confirm_and_start,
-                inputs=[enemy_base_cb, attack_target_radio, custom_lon, custom_lat],
+                inputs=[enemy_base_cb, attack_target_radio, modal_target_lon, modal_target_lat],
                 outputs=[scenario_state, scenario_modal, scenario_label, start_btn],
             )
 
