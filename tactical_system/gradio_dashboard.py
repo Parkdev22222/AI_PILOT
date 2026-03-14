@@ -1099,8 +1099,14 @@ class TacticalDashboard:
         #confirm-scenario-btn {
           background:#a6e3a1 !important; color:#1e1e2e !important;
           border:none !important; border-radius:8px !important;
-          font-weight:700 !important; padding:8px 20px !important;
-          cursor:pointer !important;
+          font-weight:700 !important; font-size:0.95rem !important;
+          padding:10px 20px !important; cursor:pointer !important;
+          flex:2 !important;
+        }
+        #confirm-scenario-btn:disabled,
+        #confirm-scenario-btn[disabled] {
+          background:#45475a !important; color:#a6adc8 !important;
+          cursor:not-allowed !important;
         }
         #cancel-scenario-btn {
           background:#f38ba8 !important; color:#1e1e2e !important;
@@ -1362,7 +1368,7 @@ class TacticalDashboard:
 
                     with gr.Row():
                         confirm_btn = gr.Button(
-                            "✅ 시나리오 확인", elem_id="confirm-scenario-btn",
+                            "▶ 시뮬레이션 시작", elem_id="confirm-scenario-btn",
                         )
                         cancel_btn = gr.Button(
                             "✖ 취소", elem_id="cancel-scenario-btn",
@@ -1409,7 +1415,22 @@ class TacticalDashboard:
                 outputs=[custom_coord_row],
             )
 
-            def _on_confirm(bases, target_name, lon, lat):
+            def _start_sim_thread(scenario: dict):
+                """시뮬레이션 스레드 시작 (중복 방지)."""
+                if not self._sim_started:
+                    self._sim_started = True
+                    if self.start_callback:
+                        import threading
+                        t = threading.Thread(
+                            target=self.start_callback,
+                            args=(scenario,),
+                            daemon=True,
+                            name="SimThread",
+                        )
+                        t.start()
+
+            def _on_confirm_and_start(bases, target_name, lon, lat):
+                """시나리오 확인 + 시뮬레이션 즉시 시작."""
                 # 기지 선택 검증
                 valid_bases = [b for b in (bases or []) if b in ENEMY_BASES]
                 if not valid_bases:
@@ -1429,38 +1450,37 @@ class TacticalDashboard:
 
                 # 라벨 갱신
                 bases_str = ", ".join(valid_bases)
-                if coords:
-                    tgt_str = f"{target_name} ({coords[0]:.3f}°E, {coords[1]:.3f}°N)"
-                else:
-                    tgt_str = "없음"
+                tgt_str = (
+                    f"{target_name} ({coords[0]:.3f}°E, {coords[1]:.3f}°N)"
+                    if coords else "없음"
+                )
                 label_html = (
                     f"<div class='scenario-label-box'>"
                     f"🗺 <b>적 기지:</b> {bases_str}<br>"
                     f"🎯 <b>공격 목표:</b> {tgt_str}"
                     f"</div>"
                 )
-                return scenario, gr.update(visible=False), label_html
+
+                # 시뮬레이션 스레드 시작
+                _start_sim_thread(scenario)
+
+                return (
+                    scenario,                                                        # scenario_state
+                    gr.update(visible=False),                                        # scenario_modal 닫기
+                    label_html,                                                      # scenario_label
+                    gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False),  # start_btn
+                )
 
             confirm_btn.click(
-                fn=_on_confirm,
+                fn=_on_confirm_and_start,
                 inputs=[enemy_base_cb, attack_target_radio, custom_lon, custom_lat],
-                outputs=[scenario_state, scenario_modal, scenario_label],
+                outputs=[scenario_state, scenario_modal, scenario_label, start_btn],
             )
 
-            # ── 시뮬레이션 시작 버튼 ─────────────────────────────────────
+            # ── 메인 시뮬레이션 시작 버튼 (시나리오 미설정 시 기본값으로 시작) ────
             def _on_start_click(scenario):
-                if not self._sim_started:
-                    self._sim_started = True
-                    if self.start_callback:
-                        import threading
-                        t = threading.Thread(
-                            target=self.start_callback,
-                            args=(scenario,),
-                            daemon=True,
-                            name="SimThread",
-                        )
-                        t.start()
-                return gr.Button(value="⏳ 시뮬레이션 실행 중...", interactive=False)
+                _start_sim_thread(scenario or {})
+                return gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False)
 
             start_btn.click(fn=_on_start_click, inputs=[scenario_state], outputs=[start_btn])
 
