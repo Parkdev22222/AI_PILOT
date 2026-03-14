@@ -428,28 +428,21 @@ class TacticalDashboard:
 
     def _render_modal_map(
         self,
-        marker_lon: Optional[float] = None,
-        marker_lat: Optional[float] = None,
+        markers=None,
     ) -> np.ndarray:
         """
         시나리오 모달용 지도를 numpy RGB 배열로 렌더링.
+        markers: (lon, lat, color) 튜플 리스트
         fig.savefig → PIL 경로를 사용해 Gradio 스레드 환경에서도 안정적으로 동작.
         """
         fig = self._make_map_figure()   # self._map_axes_frac 갱신
         ax = fig.axes[0]
 
-        if marker_lon is not None and marker_lat is not None:
-            ax.plot(
-                marker_lon, marker_lat, "*",
-                color="#f9e2af", markersize=22,
-                markeredgecolor="#1e1e2e", markeredgewidth=1.5,
-                zorder=15,
-            )
-            ax.plot(
-                marker_lon, marker_lat, "+",
-                color="white", markersize=16,
-                markeredgewidth=2.0, zorder=16,
-            )
+        for lon, lat, color in (markers or []):
+            ax.plot(lon, lat, "*", color=color, markersize=22,
+                    markeredgecolor="#1e1e2e", markeredgewidth=1.5, zorder=15)
+            ax.plot(lon, lat, "+", color="white", markersize=14,
+                    markeredgewidth=2.0, zorder=16)
 
         buf = io.BytesIO()
         # bbox_inches 지정 안 함 → 정확히 figsize*dpi 픽셀 (630×540)
@@ -464,15 +457,24 @@ class TacticalDashboard:
 
     def _render_modal_map_html(
         self,
-        marker_lon: Optional[float] = None,
-        marker_lat: Optional[float] = None,
+        bases_data=None,
+        active_base=None,
     ) -> str:
         """
         지도를 base64 <img> HTML 문자열로 반환.
         gr.Image 대신 gr.HTML 을 사용 → visible=False 컨테이너 렌더링 문제 회피.
         onclick 핸들러가 클릭 좌표를 위경도로 변환 후 숨겨진 Textbox 에 기록.
+        bases_data: {기지명: {"selected": bool, "target_lon": float|None, "target_lat": float|None, ...}}
+        active_base: 현재 선택된 기지명 (황색 마커), 나머지 selected는 초록
         """
-        img_arr = self._render_modal_map(marker_lon, marker_lat)
+        markers = []
+        if bases_data:
+            for name, d in bases_data.items():
+                if d.get("selected") and d.get("target_lon") is not None:
+                    color = "#f9e2af" if name == active_base else "#a6e3a1"
+                    markers.append((d["target_lon"], d["target_lat"], color))
+
+        img_arr = self._render_modal_map(markers=markers)
 
         from PIL import Image as _PIL
         pil_img = _PIL.fromarray(img_arr)
@@ -513,6 +515,71 @@ class TacticalDashboard:
             f"onclick=\"{js}.call(this,event)\" />"
             "</div>"
         )
+
+    def _render_base_list_html(self, bases_data=None, active_base=None) -> str:
+        """
+        기지 목록을 커스텀 HTML로 렌더링.
+        - 기지 행 클릭 → base_action_tb에 "select:기지명" 기록
+        - 체크박스 영역 클릭 → base_action_tb에 "toggle:기지명" 기록 (stopPropagation)
+        - active_base는 파란색 테두리로 강조
+        - selected=True이면 배경색 #1e2030, 아니면 opacity 0.55
+        """
+        if not bases_data:
+            return "<div></div>"
+
+        rows_html = ""
+        for name, d in (bases_data or {}).items():
+            selected = d.get("selected", False)
+            is_active = (name == active_base)
+            tgt_lon = d.get("target_lon")
+            tgt_lat = d.get("target_lat")
+
+            border_style = "border:2px solid #89b4fa;" if is_active else "border:2px solid #45475a;"
+            bg_style = "background:#1e2030;" if selected else "background:#181825;"
+            opacity_style = "" if selected else "opacity:0.55;"
+            checkbox_char = "☑" if selected else "☐"
+
+            if tgt_lon is not None and tgt_lat is not None:
+                tgt_text = f"📍 {tgt_lon:.3f}°E, {tgt_lat:.3f}°N"
+                tgt_color = "#a6e3a1"
+            else:
+                tgt_text = "— 미설정"
+                tgt_color = "#6c7086"
+
+            js_select = (
+                f"(function(){{"
+                f"var tb=document.querySelector('#base-action-tb textarea');"
+                f"if(tb){{tb.value='select:{name}';"
+                f"tb.dispatchEvent(new Event('input',{{bubbles:true}}));}}"
+                f"}})()"
+            )
+            js_toggle = (
+                f"(function(e){{"
+                f"e.stopPropagation();"
+                f"var tb=document.querySelector('#base-action-tb textarea');"
+                f"if(tb){{tb.value='toggle:{name}';"
+                f"tb.dispatchEvent(new Event('input',{{bubbles:true}}));}}"
+                f"}})(event)"
+            )
+
+            rows_html += (
+                f"<div style='display:flex;align-items:center;padding:8px 10px;"
+                f"border-radius:8px;margin-bottom:6px;cursor:pointer;"
+                f"{border_style}{bg_style}{opacity_style}' "
+                f"onclick=\"{js_select}\">"
+                f"<span style='font-size:1.1rem;margin-right:8px;cursor:pointer;' "
+                f"onclick=\"{js_toggle}\">{checkbox_char}</span>"
+                f"<span style='flex:1;color:#cdd6f4;font-weight:600;'>{name}</span>"
+                f"<span style='color:{tgt_color};font-size:0.8rem;'>{tgt_text}</span>"
+                f"</div>"
+            )
+
+        hint = (
+            "<div style='color:#89b4fa;font-size:0.8rem;margin-bottom:8px;'>"
+            "기지 클릭 → 지도에서 목표 설정 | ☑/☐ 클릭 → 출격 포함/제외"
+            "</div>"
+        )
+        return f"<div style='margin-bottom:12px;'>{hint}{rows_html}</div>"
 
     def _px_to_lonlat(
         self, px: int, py: int
