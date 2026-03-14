@@ -1337,19 +1337,25 @@ class TacticalDashboard:
         .scenario-title {
           font-size:1.1rem; font-weight:700;
           color:#89b4fa; margin-bottom:16px;
-          position: sticky !important;
-          top: -24px !important;
-          z-index: 20 !important;
-          background: #2a2a3e !important;
-          padding: 16px 0 8px 0 !important;
-          margin-top: -16px !important;
         }
-        #current-base-label {
-          position: sticky !important;
-          top: 30px !important;
-          z-index: 19 !important;
-          background: #2a2a3e !important;
-          padding: 4px 0 !important;
+        /* 모달 제목·레이블 textbox 스타일 */
+        .modal-title-tb textarea,
+        .modal-title-tb input {
+          background: #1e2030 !important;
+          border: 1px solid #45475a !important;
+          border-radius: 8px !important;
+          color: #89b4fa !important;
+          font-size: 1rem !important;
+          font-weight: 700 !important;
+          padding: 8px 14px !important;
+          cursor: default !important;
+          resize: none !important;
+          pointer-events: none !important;
+        }
+        .modal-title-tb { margin-bottom: 10px !important; }
+        #current-base-label textarea,
+        #current-base-label input {
+          font-size: 0.92rem !important;
         }
         #confirm-scenario-btn {
           background:#a6e3a1 !important; color:#1e1e2e !important;
@@ -1599,7 +1605,11 @@ class TacticalDashboard:
 
             with gr.Column(visible=False, elem_id="scenario-modal-wrap") as scenario_modal:
                 with gr.Column(elem_id="scenario-modal-inner"):
-                    gr.HTML("<div class='scenario-title'>🗺 시나리오 설정</div>")
+                    gr.Textbox(
+                        value="🗺 시나리오 설정",
+                        interactive=False, show_label=False,
+                        elem_classes=["modal-title-tb"],
+                    )
 
                     # 기지 목록 (커스텀 HTML, Svelte 렌더 버그 회피)
                     gr.HTML("<div class='modal-section-label'>🛫 적군 출격 기지</div>")
@@ -1620,9 +1630,11 @@ class TacticalDashboard:
                     )
 
                     # 지도 섹션
-                    current_base_label = gr.HTML(
-                        value=f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{_first_base}</b></div>",
+                    current_base_label = gr.Textbox(
+                        value=f"📍 공격 목표 설정 — 현재: {_first_base}",
+                        interactive=False, show_label=False,
                         elem_id="current-base-label",
+                        elem_classes=["modal-title-tb"],
                     )
                     modal_map_html = gr.HTML(
                         value=self._render_modal_map_html(_init_bases, _first_base),
@@ -1690,7 +1702,7 @@ class TacticalDashboard:
                 first_base = list(ENEMY_BASES.keys())[0]
                 map_html = self._render_modal_map_html(init_bases, first_base)
                 base_list = self._render_base_list_html(init_bases, first_base)
-                cur_lbl = f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{first_base}</b></div>"
+                cur_lbl = f"📍 공격 목표 설정 — 현재: {first_base}"
                 return (
                     gr.update(visible=True),  # scenario_modal
                     base_list,                 # base_list_html
@@ -1727,7 +1739,7 @@ class TacticalDashboard:
                     bd[base_name]["selected"] = True
                 map_html = self._render_modal_map_html(bd, active_base)
                 base_list = self._render_base_list_html(bd, active_base)
-                cur_lbl = f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{active_base}</b></div>"
+                cur_lbl = f"📍 공격 목표 설정 — 현재: {active_base}"
                 return map_html, base_list, cur_lbl, bd, active_base, ""
 
             base_action_tb.input(
@@ -1753,7 +1765,7 @@ class TacticalDashboard:
                     bd[active_base]["target_name"] = "직접 선택"
                 map_html = self._render_modal_map_html(bd, active_base)
                 base_list = self._render_base_list_html(bd, active_base)
-                cur_lbl = f"<div class='modal-section-label'>📍 공격 목표 설정 — 현재: <b>{active_base}</b></div>"
+                cur_lbl = f"📍 공격 목표 설정 — 현재: {active_base}"
                 return map_html, base_list, cur_lbl, bd, ""
 
             click_tb.input(
