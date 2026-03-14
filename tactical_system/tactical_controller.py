@@ -135,6 +135,8 @@ class TacticalController:
         llm_device: str = "auto",
         seed: int = 42,
         num_enemy_formations: Optional[int] = None,
+        enemy_bases_override: Optional[List[str]] = None,
+        attack_target: Optional[Tuple[float, float]] = None,
     ):
         random.seed(seed)
         np.random.seed(seed)
@@ -150,14 +152,24 @@ class TacticalController:
         self.db = CombatDB(db_path)
         logger.info(f"DB 경로: {db_path}")
 
-        # ── 1단계: 적군 출격 기지 랜덤 선택 ──────────────────────────────
+        # ── 1단계: 적군 출격 기지 선택 ───────────────────────────────────
         all_enemy_bases = list(ENEMY_BASES.keys())
-        n = (
-            num_enemy_formations
-            if num_enemy_formations is not None
-            else random.randint(1, len(all_enemy_bases))
-        )
-        self.enemy_bases_selected: List[str] = random.sample(all_enemy_bases, n)
+        if enemy_bases_override:
+            # 시나리오 UI에서 직접 지정한 기지 목록 사용
+            self.enemy_bases_selected = [
+                b for b in enemy_bases_override if b in ENEMY_BASES
+            ]
+            if not self.enemy_bases_selected:
+                logger.warning("enemy_bases_override 유효한 기지 없음. 랜덤 선택.")
+                self.enemy_bases_selected = random.sample(all_enemy_bases, 1)
+            n = len(self.enemy_bases_selected)
+        else:
+            n = (
+                num_enemy_formations
+                if num_enemy_formations is not None
+                else random.randint(1, len(all_enemy_bases))
+            )
+            self.enemy_bases_selected = random.sample(all_enemy_bases, n)
         logger.info(f"적군 출격 기지 ({n}개): {self.enemy_bases_selected}")
 
         # 전장 중심 (DMZ 근방)
@@ -286,7 +298,13 @@ class TacticalController:
             enm_policy_path=enm_policy_path,
             battle_field_center=self.battle_field_center,
             device=device,
+            attack_target=attack_target,
         )
+        if attack_target is not None:
+            logger.info(
+                f"시나리오 공격 목표: 경도 {attack_target[0]:.3f}°, "
+                f"위도 {attack_target[1]:.3f}°"
+            )
         self.env.register_formation_ids(friendly_db_ids, enemy_db_ids)
         logger.info("환경 초기화 완료.")
 

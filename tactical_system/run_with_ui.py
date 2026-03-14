@@ -74,50 +74,75 @@ def main():
     from tactical_system.tactical_controller import TacticalController
     from tactical_system.gradio_dashboard import TacticalDashboard
 
-    # ── 1. 컨트롤러 초기화 (LLM 로드 포함 — 수십 초 소요 가능) ──────────
+    # ── 1. 대시보드 먼저 생성 (컨트롤러는 버튼 클릭 시 초기화) ──────────
     print("=" * 60)
-    print("전술 시뮬레이터 초기화 중 (LLM 로드 포함)...")
+    print("전술 시뮬레이터 대시보드 시작 중...")
+    print("UI 우측 하단 '▶ 시뮬레이션 시작' 버튼을 눌러 시뮬레이션을 시작하세요.")
     print("=" * 60)
 
-    controller = TacticalController(
-        ego_policy_path=args.ego_policy,
-        enm_policy_path=args.enm_policy,
-        llm_model_id=args.llm_model,
+    dashboard = TacticalDashboard(
         db_path=args.db_path,
-        max_steps=args.max_steps,
-        render=args.render,
-        render_path=args.render_path,
-        device=args.device,
-        llm_device=args.llm_device,
-        seed=args.seed,
-        num_enemy_formations=args.num_enemy,
+        sim_id=None,           # 컨트롤러 생성 후 자동 발견
+        refresh_interval=args.refresh,
+        start_callback=None,   # 아래에서 설정
     )
 
-    print(f"\n[초기화 완료]")
-    print(f"  시뮬레이션 ID : {controller.sim_id}")
-    print(f"  적군 기지     : {controller.enemy_bases_selected}")
-    print(f"  편대쌍 수     : {len(controller.formation_pairs)}")
-    print(f"  DB 경로       : {args.db_path}")
-    print()
-
     # ── 2. 시뮬레이션 시작 콜백 (UI 버튼 클릭 시 호출) ──────────────
-    def _start_simulation():
+    # scenario: {"enemy_bases": [...], "attack_target": (lon, lat) | None}
+    def _start_simulation(scenario: dict = None):
+        scenario = scenario or {}
+
+        enemy_bases_override = scenario.get("enemy_bases") or None
+        attack_target = scenario.get("attack_target") or None
+
+        print("\n[시뮬레이션 초기화 시작]")
+        if enemy_bases_override:
+            print(f"  적군 기지 (지정): {enemy_bases_override}")
+        else:
+            print("  적군 기지: 랜덤 선택")
+        if attack_target:
+            tgt_name = scenario.get("attack_target_name", "직접 입력")
+            print(f"  공격 목표: {tgt_name} {attack_target}")
+        else:
+            print("  공격 목표: 없음 (기본 접근)")
+        print("  LLM 로드 중 (수십 초 소요 가능)...")
+
         try:
+            controller = TacticalController(
+                ego_policy_path=args.ego_policy,
+                enm_policy_path=args.enm_policy,
+                llm_model_id=args.llm_model,
+                db_path=args.db_path,
+                max_steps=args.max_steps,
+                render=args.render,
+                render_path=args.render_path,
+                device=args.device,
+                llm_device=args.llm_device,
+                seed=args.seed,
+                num_enemy_formations=args.num_enemy,
+                enemy_bases_override=enemy_bases_override,
+                attack_target=attack_target,
+            )
+
+            print(f"\n[초기화 완료]")
+            print(f"  시뮬레이션 ID : {controller.sim_id}")
+            print(f"  적군 기지     : {controller.enemy_bases_selected}")
+            print(f"  편대쌍 수     : {len(controller.formation_pairs)}")
+            print(f"  DB 경로       : {args.db_path}\n")
+
+            # 대시보드가 새 sim_id 를 자동 발견하도록 초기화
+            dashboard._explicit_sim_id = controller.sim_id
+
             controller.run()
         except Exception as exc:
             logger.error(f"시뮬레이션 오류: {exc}", exc_info=True)
 
+    dashboard.start_callback = _start_simulation
+
     # ── 3. Gradio 대시보드 실행 ───────────────────────────────────────
-    print(f"\nGradio 대시보드 시작: http://0.0.0.0:{args.port}")
-    print("UI 우측 하단 '▶ 시뮬레이션 시작' 버튼을 눌러 시뮬레이션을 시작하세요.")
+    print(f"\nGradio 대시보드: http://0.0.0.0:{args.port}")
     print("Ctrl+C 로 종료\n")
 
-    dashboard = TacticalDashboard(
-        db_path=args.db_path,
-        sim_id=controller.sim_id,
-        refresh_interval=args.refresh,
-        start_callback=_start_simulation,
-    )
     dashboard.launch(
         server_port=args.port,
         share=args.share,

@@ -150,6 +150,16 @@ class CombatDB:
             conn.close()
         return sim_id
 
+    def get_latest_sim_id(self) -> Optional[int]:
+        """DB에서 가장 최근 시뮬레이션 ID를 반환. 없으면 None."""
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT sim_id FROM simulation_info ORDER BY sim_id DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+        return int(row[0]) if row else None
+
     def update_simulation_status(self, sim_id: int, status: str):
         with self._lock:
             conn = self._get_conn()

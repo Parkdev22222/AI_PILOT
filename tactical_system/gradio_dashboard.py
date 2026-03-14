@@ -35,6 +35,16 @@ import pandas as pd
 from .combat_db import CombatDB
 from .llm_commander import ENEMY_BASES, FRIENDLY_BASES
 
+# ── 시나리오: 공격 목표 지점 후보 ─────────────────────────────────────────────
+ATTACK_TARGETS: Dict[str, Optional[Tuple[float, float]]] = {
+    "서울 수도권":   (126.978, 37.566),
+    "인천 국제공항": (126.452, 37.469),
+    "수원 공군기지": (127.016, 37.263),
+    "대전 군사시설": (127.385, 36.350),
+    "부산 항만":     (129.075, 35.180),
+    "직접 입력":     None,
+}
+
 # ── 기지 정보 (고정 마커) ────────────────────────────────────────────────────
 
 _ALL_BASES = {
@@ -118,40 +128,58 @@ class TacticalDashboard:
     def __init__(
         self,
         db_path: str = "combat_simulation.db",
-        sim_id: int = 1,
+        sim_id: Optional[int] = None,
         refresh_interval: float = 2.0,
         start_callback=None,
     ):
         self.db = CombatDB(db_path)
-        self.sim_id = sim_id
+        self._explicit_sim_id: Optional[int] = sim_id
         self.refresh_interval = refresh_interval
         self.start_callback = start_callback
         self._sim_started = False
+
+    def _get_sim_id(self) -> Optional[int]:
+        """명시 sim_id가 있으면 그것을, 없으면 DB에서 최신 sim_id를 반환."""
+        if self._explicit_sim_id is not None:
+            return self._explicit_sim_id
+        sid = self.db.get_latest_sim_id()
+        if sid is not None:
+            self._explicit_sim_id = sid  # 한 번 찾으면 고정
+        return sid
 
     # ------------------------------------------------------------------
     # 데이터 조회
     # ------------------------------------------------------------------
 
     def _states(self) -> List[Dict]:
+        sid = self._get_sim_id()
+        if sid is None:
+            return []
         try:
-            return self.db.get_latest_aircraft_states(self.sim_id)
+            return self.db.get_latest_aircraft_states(sid)
         except Exception:
             return []
 
     def _formations(self) -> List[Dict]:
+        sid = self._get_sim_id()
+        if sid is None:
+            return []
         try:
-            return self.db.get_formations(self.sim_id)
+            return self.db.get_formations(sid)
         except Exception:
             return []
 
     def _events(self) -> List[Dict]:
+        sid = self._get_sim_id()
+        if sid is None:
+            return []
         try:
             import sqlite3
             conn = sqlite3.connect(self.db.db_path)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM events WHERE sim_id=? ORDER BY step ASC LIMIT 100",
-                (self.sim_id,),
+                (sid,),
             ).fetchall()
             conn.close()
             result = [dict(r) for r in rows]
@@ -169,8 +197,11 @@ class TacticalDashboard:
             return []
 
     def _llm_decisions(self) -> List[Dict]:
+        sid = self._get_sim_id()
+        if sid is None:
+            return []
         try:
-            return self.db.get_recent_decisions(self.sim_id, limit=50)
+            return self.db.get_recent_decisions(sid, limit=50)
         except Exception:
             return []
 
@@ -1012,13 +1043,70 @@ class TacticalDashboard:
           border:none !important; border-radius:8px !important;
           font-size:0.95rem !important; font-weight:700 !important;
           padding:10px 0 !important; cursor:pointer !important;
-          transition:background 0.2s;
         }
         #start-sim-btn:hover { background:#94d3a2 !important; }
         #start-sim-btn:disabled,
         #start-sim-btn[disabled] {
           background:#45475a !important; color:#a6adc8 !important;
           cursor:not-allowed !important;
+        }
+
+        /* ── 시나리오 생성 버튼 ── */
+        #scenario-btn {
+          width:100%; margin-top:4px;
+          background:#89b4fa !important; color:#1e1e2e !important;
+          border:none !important; border-radius:8px !important;
+          font-size:0.90rem !important; font-weight:700 !important;
+          padding:9px 0 !important; cursor:pointer !important;
+        }
+        #scenario-btn:hover { background:#74aaed !important; }
+
+        /* ── 시나리오 현황 라벨 ── */
+        .scenario-label-box {
+          background:#2a2a3e; border:1px solid #45475a;
+          border-radius:6px; padding:6px 10px;
+          font-size:0.78rem; color:#cba6f7;
+          margin-top:6px; word-break:break-all;
+        }
+
+        /* ── 시나리오 설정 모달 패널 ── */
+        #scenario-modal-wrap {
+          position: fixed !important;
+          top: 0 !important; left: 0 !important;
+          width: 100vw !important; height: 100vh !important;
+          z-index: 9990 !important;
+          background: rgba(0,0,0,0.72) !important;
+          display: flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+        }
+        #scenario-modal-wrap > .wrap,
+        #scenario-modal-wrap > div { background: transparent !important; }
+
+        #scenario-modal-inner {
+          background: #2a2a3e !important;
+          border: 2px solid #89b4fa !important;
+          border-radius: 14px !important;
+          padding: 28px 32px !important;
+          min-width: 480px !important; max-width: 640px !important;
+          box-shadow: 0 16px 48px rgba(0,0,0,0.8) !important;
+          max-height: 85vh !important; overflow-y: auto !important;
+        }
+        .scenario-title {
+          font-size:1.1rem; font-weight:700;
+          color:#89b4fa; margin-bottom:16px;
+        }
+        #confirm-scenario-btn {
+          background:#a6e3a1 !important; color:#1e1e2e !important;
+          border:none !important; border-radius:8px !important;
+          font-weight:700 !important; padding:8px 20px !important;
+          cursor:pointer !important;
+        }
+        #cancel-scenario-btn {
+          background:#f38ba8 !important; color:#1e1e2e !important;
+          border:none !important; border-radius:8px !important;
+          font-weight:700 !important; padding:8px 20px !important;
+          cursor:pointer !important;
         }
         """
 
@@ -1228,11 +1316,57 @@ class TacticalDashboard:
                         elem_classes=["legend-md"],
                     )
 
+                    scenario_label = gr.HTML(
+                        value="<div class='scenario-label-box'>📋 시나리오 미설정 (랜덤 기지 · 목표 없음)</div>",
+                    )
+                    scenario_btn = gr.Button(
+                        value="🗺 시나리오 생성",
+                        elem_id="scenario-btn",
+                        interactive=True,
+                    )
                     start_btn = gr.Button(
                         value="▶ 시뮬레이션 시작",
                         elem_id="start-sim-btn",
                         interactive=True,
                     )
+
+            # ── 시나리오 설정 모달 패널 ────────────────────────────────
+            # CSS position:fixed 로 화면 중앙에 오버레이 표시
+            scenario_state = gr.State({})  # 확정된 시나리오 dict
+
+            with gr.Column(visible=False, elem_id="scenario-modal-wrap") as scenario_modal:
+                with gr.Column(elem_id="scenario-modal-inner"):
+                    gr.HTML("<div class='scenario-title'>🗺 시나리오 설정</div>")
+
+                    enemy_base_cb = gr.CheckboxGroup(
+                        choices=list(ENEMY_BASES.keys()),
+                        value=list(ENEMY_BASES.keys())[:1],
+                        label="적군 출격 기지 (복수 선택 가능)",
+                    )
+
+                    attack_target_radio = gr.Radio(
+                        choices=list(ATTACK_TARGETS.keys()),
+                        value=list(ATTACK_TARGETS.keys())[0],
+                        label="공격 목표 지점",
+                    )
+
+                    with gr.Row(visible=False) as custom_coord_row:
+                        custom_lon = gr.Number(
+                            label="목표 경도 (°E)", value=127.0,
+                            minimum=124.0, maximum=132.0, precision=4,
+                        )
+                        custom_lat = gr.Number(
+                            label="목표 위도 (°N)", value=37.5,
+                            minimum=33.0, maximum=43.0, precision=4,
+                        )
+
+                    with gr.Row():
+                        confirm_btn = gr.Button(
+                            "✅ 시나리오 확인", elem_id="confirm-scenario-btn",
+                        )
+                        cancel_btn = gr.Button(
+                            "✖ 취소", elem_id="cancel-scenario-btn",
+                        )
 
             # ── 이벤트 로그 (정적 골격, JS가 ev-tbody만 갱신) ─────────
             gr.HTML(
@@ -1253,18 +1387,82 @@ class TacticalDashboard:
                 outputs=[map_carrier, data_carrier],
             )
 
-            def _on_start_click():
+            # ── 시나리오 버튼 콜백 ────────────────────────────────────────
+            scenario_btn.click(
+                fn=lambda: gr.update(visible=True),
+                inputs=[],
+                outputs=[scenario_modal],
+            )
+
+            cancel_btn.click(
+                fn=lambda: gr.update(visible=False),
+                inputs=[],
+                outputs=[scenario_modal],
+            )
+
+            def _on_target_change(target_name):
+                return gr.update(visible=(target_name == "직접 입력"))
+
+            attack_target_radio.change(
+                fn=_on_target_change,
+                inputs=[attack_target_radio],
+                outputs=[custom_coord_row],
+            )
+
+            def _on_confirm(bases, target_name, lon, lat):
+                # 기지 선택 검증
+                valid_bases = [b for b in (bases or []) if b in ENEMY_BASES]
+                if not valid_bases:
+                    valid_bases = list(ENEMY_BASES.keys())[:1]
+
+                # 공격 목표 좌표 결정
+                if target_name == "직접 입력":
+                    coords = (float(lon), float(lat))
+                else:
+                    coords = ATTACK_TARGETS.get(target_name)
+
+                scenario = {
+                    "enemy_bases": valid_bases,
+                    "attack_target": coords,
+                    "attack_target_name": target_name,
+                }
+
+                # 라벨 갱신
+                bases_str = ", ".join(valid_bases)
+                if coords:
+                    tgt_str = f"{target_name} ({coords[0]:.3f}°E, {coords[1]:.3f}°N)"
+                else:
+                    tgt_str = "없음"
+                label_html = (
+                    f"<div class='scenario-label-box'>"
+                    f"🗺 <b>적 기지:</b> {bases_str}<br>"
+                    f"🎯 <b>공격 목표:</b> {tgt_str}"
+                    f"</div>"
+                )
+                return scenario, gr.update(visible=False), label_html
+
+            confirm_btn.click(
+                fn=_on_confirm,
+                inputs=[enemy_base_cb, attack_target_radio, custom_lon, custom_lat],
+                outputs=[scenario_state, scenario_modal, scenario_label],
+            )
+
+            # ── 시뮬레이션 시작 버튼 ─────────────────────────────────────
+            def _on_start_click(scenario):
                 if not self._sim_started:
                     self._sim_started = True
                     if self.start_callback:
                         import threading
                         t = threading.Thread(
-                            target=self.start_callback, daemon=True, name="SimThread"
+                            target=self.start_callback,
+                            args=(scenario,),
+                            daemon=True,
+                            name="SimThread",
                         )
                         t.start()
                 return gr.Button(value="⏳ 시뮬레이션 실행 중...", interactive=False)
 
-            start_btn.click(fn=_on_start_click, inputs=[], outputs=[start_btn])
+            start_btn.click(fn=_on_start_click, inputs=[scenario_state], outputs=[start_btn])
 
         return demo
 

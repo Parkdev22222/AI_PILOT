@@ -260,6 +260,7 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         enm_policy_path: str,
         battle_field_center: Tuple[float, float, float] = (127.5, 38.5, 0.0),
         device: str = "cpu",
+        attack_target: Optional[Tuple[float, float]] = None,
     ):
         self.formation_pairs = formation_pairs
         self.db = db
@@ -333,6 +334,14 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
         self.event_formation_destroyed: Dict[int, int] = {}
         # 적 편대 전멸(아군 승리): pair_idx → event_id
         self.event_enemy_formation_destroyed: Dict[int, int] = {}
+
+        # 시나리오 공격 목표 지점 (lon, lat) — 적기 approach 방향 결정에 사용
+        self.attack_target: Optional[Tuple[float, float]] = attack_target
+        if attack_target is not None:
+            logger.info(
+                f"시나리오 공격 목표 설정: 경도 {attack_target[0]:.3f}°, "
+                f"위도 {attack_target[1]:.3f}°"
+            )
 
         # 스폰 일련번호 (중복 UID 방지)
         self._spawn_counter: int = 0
@@ -521,9 +530,18 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     all_actions[uid] = np.array([1, 2, 1, 0], dtype=np.int32)
                     continue
                 if phase == "approach":
-                    tgt_lon, tgt_lat = self._formation_centroid(friendly_uids)
-                    all_actions[uid] = _autopilot_hierarchical_action(
-                        sim, tgt_lon, tgt_lat)
+                    if self.attack_target is not None:
+                        # 시나리오 설정 공격 목표로 go_dest 기동
+                        tgt_lon, tgt_lat = self.attack_target
+                        all_actions[uid] = self.task.go_dest(
+                            self, uid,
+                            dest_lon=tgt_lon,
+                            dest_lat=tgt_lat,
+                        )
+                    else:
+                        tgt_lon, tgt_lat = self._formation_centroid(friendly_uids)
+                        all_actions[uid] = _autopilot_hierarchical_action(
+                            sim, tgt_lon, tgt_lat)
                 else:
                     all_actions[uid] = self._rl_action_enm(uid)
 
