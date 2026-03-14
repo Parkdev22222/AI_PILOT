@@ -462,6 +462,58 @@ class TacticalDashboard:
         self._modal_img_wh = pil_img.size   # (width, height)
         return np.array(pil_img)
 
+    def _render_modal_map_html(
+        self,
+        marker_lon: Optional[float] = None,
+        marker_lat: Optional[float] = None,
+    ) -> str:
+        """
+        지도를 base64 <img> HTML 문자열로 반환.
+        gr.Image 대신 gr.HTML 을 사용 → visible=False 컨테이너 렌더링 문제 회피.
+        onclick 핸들러가 클릭 좌표를 위경도로 변환 후 숨겨진 Textbox 에 기록.
+        """
+        img_arr = self._render_modal_map(marker_lon, marker_lat)
+
+        from PIL import Image as _PIL
+        pil_img = _PIL.fromarray(img_arr)
+        buf2 = io.BytesIO()
+        pil_img.save(buf2, format="PNG")
+        b64 = base64.b64encode(buf2.getvalue()).decode()
+
+        # axes fraction 및 이미지 크기 (JS 에서 좌표 변환에 사용)
+        x0, y0, x1, y1 = self._map_axes_frac
+        img_w, img_h = self._modal_img_wh
+        LON_MIN, LON_MAX = 124.0, 131.0
+        LAT_MAX, LAT_MIN = 43.0, 34.5
+
+        # inline onclick: 축 영역 클릭 → lon,lat 계산 → 숨겨진 textarea 에 기록
+        js = (
+            f"(function(e){{"
+            f"var img=this;"
+            f"var r=img.getBoundingClientRect();"
+            f"var px=(e.clientX-r.left)/r.width*{img_w};"
+            f"var py=(e.clientY-r.top)/r.height*{img_h};"
+            f"var x0={x0},y0={y0},x1={x1},y1={y1};"
+            f"var fx=px/{img_w},fy=py/{img_h};"
+            f"var at=1-y1,ab=1-y0;"
+            f"if(fx<x0||fx>x1||fy<at||fy>ab)return;"
+            f"var t=(fx-x0)/(x1-x0),s=(fy-at)/(ab-at);"
+            f"var lon=({LON_MIN}+t*{LON_MAX-LON_MIN}).toFixed(4);"
+            f"var lat=({LAT_MAX}-s*{LAT_MAX-LAT_MIN}).toFixed(4);"
+            f"var tb=document.querySelector('#modal-map-click-tb textarea');"
+            f"if(tb){{tb.value=lon+','+lat;"
+            f"tb.dispatchEvent(new Event('input',{{bubbles:true}}));}}"
+            f"}})"
+        )
+
+        return (
+            "<div style='cursor:crosshair;user-select:none;'>"
+            f"<img src='data:image/png;base64,{b64}' "
+            f"style='width:100%;display:block;border-radius:6px;' "
+            f"onclick=\"{js}.call(this,event)\" />"
+            "</div>"
+        )
+
     def _px_to_lonlat(
         self, px: int, py: int
     ) -> Tuple[Optional[float], Optional[float]]:
@@ -1176,25 +1228,36 @@ class TacticalDashboard:
           font-size: 0.85rem; color: #f9e2af;
           margin: 6px 0; text-align: center;
         }
-        /* 모달 지도 이미지 — 클릭 커서 */
-        #modal-map-img img { cursor: crosshair !important; }
-        /* 모달 내 Gradio 컴포넌트 배경 투명화 + 텍스트 강제 표시 */
-        #scenario-modal-inner .block,
-        #scenario-modal-inner .form,
-        #scenario-modal-inner fieldset {
-          background: transparent !important;
-          border-color: #45475a !important;
+        /* JS→Python 브릿지 textbox: DOM 에 존재하되 화면 밖 배치 */
+        .modal-click-hidden {
+          position: fixed !important;
+          left: -9999px !important; top: -9999px !important;
+          width: 1px !important; height: 1px !important;
+          overflow: hidden !important; opacity: 0 !important;
+          pointer-events: none !important;
         }
+        /* 모달 HTML 지도 컨테이너 */
+        #modal-map-html { display: block; }
+        #modal-map-html img { display: block !important; width: 100% !important; }
+        /* 모달 내 Gradio 컴포넌트 — 체크박스/라디오 텍스트 강제 표시 */
         #scenario-modal-inner label,
         #scenario-modal-inner .wrap span,
-        #scenario-modal-inner .svelte-s1r2yt,
         #scenario-modal-inner input[type="checkbox"] + span,
         #scenario-modal-inner input[type="radio"]    + span {
           color: #cdd6f4 !important;
+          opacity: 1 !important;
         }
         #scenario-modal-inner input[type="checkbox"],
         #scenario-modal-inner input[type="radio"] {
-          accent-color: #89b4fa;
+          accent-color: #89b4fa !important;
+        }
+        /* Gradio 애니메이션이 opacity:0 에 멈추는 현상 방지 */
+        #scenario-modal-inner .wrap,
+        #scenario-modal-inner .form,
+        #scenario-modal-inner fieldset,
+        #scenario-modal-inner .block {
+          opacity: 1 !important;
+          border-color: #45475a !important;
         }
         .scenario-title {
           font-size:1.1rem; font-weight:700;
@@ -1459,17 +1522,20 @@ class TacticalDashboard:
                         "📍 공격 목표 지점 — 지도를 클릭하여 선택"
                         "</div>"
                     )
-                    # 클릭 가능한 지도 이미지
-                    # value를 빌드 시점에 렌더링 → 모달 열릴 때 즉시 표시
-                    # interactive=False → 업로드 UI 없이 이미지만 표시 (.select() 는 동작)
-                    modal_map = gr.Image(
-                        value=self._render_modal_map(),
-                        type="numpy",
-                        interactive=False,
-                        height=380,
+                    # gr.HTML 로 지도 표시 — visible=False 컨테이너 안에서도
+                    # base64 img 는 항상 렌더링됨 (gr.Image 의 Svelte 렌더 버그 회피)
+                    # onclick JS 가 좌표 계산 후 숨겨진 Textbox 에 "lon,lat" 기록
+                    modal_map_html = gr.HTML(
+                        value=self._render_modal_map_html(),
+                        elem_id="modal-map-html",
+                    )
+                    # JS → Python 브릿지: DOM 에 존재하되 화면 밖에 위치
+                    click_tb = gr.Textbox(
+                        value="",
+                        label="",
                         show_label=False,
-                        show_download_button=False,
-                        elem_id="modal-map-img",
+                        elem_id="modal-map-click-tb",
+                        elem_classes=["modal-click-hidden"],
                     )
 
                     # 미리 정의된 목표 선택 (라디오)
@@ -1520,14 +1586,15 @@ class TacticalDashboard:
 
             # ── 시나리오 버튼 콜백 ────────────────────────────────────────
 
-            # 모달 열기: 지도 초기 렌더링 (마커 없음)
+            # 모달 열기: 지도 HTML 초기 렌더링 (마커 없음), click_tb 초기화
             def _on_open_scenario():
-                return gr.update(visible=True), self._render_modal_map()
+                html = self._render_modal_map_html()
+                return gr.update(visible=True), html, ""
 
             scenario_btn.click(
                 fn=_on_open_scenario,
                 inputs=[],
-                outputs=[scenario_modal, modal_map],
+                outputs=[scenario_modal, modal_map_html, click_tb],
             )
 
             cancel_btn.click(
@@ -1536,50 +1603,53 @@ class TacticalDashboard:
                 outputs=[scenario_modal],
             )
 
-            # 지도 클릭 → 픽셀 좌표를 위경도로 변환 후 마커 표시
-            def _on_map_click(evt: gr.SelectData):
-                px, py = evt.index
-                lon, lat = self._px_to_lonlat(px, py)
-                if lon is None:
+            # JS onclick → click_tb 에 "lon,lat" 기록 → .input() 이벤트 → 여기서 처리
+            def _on_click_tb_input(coords_str):
+                if not coords_str or "," not in coords_str:
                     return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                img = self._render_modal_map(marker_lon=lon, marker_lat=lat)
+                try:
+                    lon, lat = (float(v) for v in coords_str.split(",", 1))
+                except ValueError:
+                    return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                html = self._render_modal_map_html(marker_lon=lon, marker_lat=lat)
                 info_html = (
                     f"<div class='target-coord-box'>"
                     f"📍 직접 선택: <b>{lon:.3f}°E, {lat:.3f}°N</b>"
                     f"</div>"
                 )
-                return img, None, info_html, float(lon), float(lat)
+                return html, None, info_html, lon, lat
 
-            modal_map.select(
-                fn=_on_map_click,
-                outputs=[modal_map, attack_target_radio, target_info_label,
+            click_tb.input(
+                fn=_on_click_tb_input,
+                inputs=[click_tb],
+                outputs=[modal_map_html, attack_target_radio, target_info_label,
                          modal_target_lon, modal_target_lat],
             )
 
-            # 미리 정의된 목표 선택 → 마커 이동 + 좌표 업데이트
+            # 미리 정의된 목표 선택 → 지도 HTML 마커 이동 + 좌표 업데이트
             def _on_preset_select(target_name):
                 coords = ATTACK_TARGETS.get(target_name) if target_name else None
                 if not coords:
-                    img = self._render_modal_map()
+                    html = self._render_modal_map_html()
                     info_html = (
                         "<div class='target-coord-box'>"
                         "📍 목표 미설정 — 지도를 클릭하거나 위 목록에서 선택"
                         "</div>"
                     )
-                    return img, info_html, None, None
+                    return html, info_html, None, None
                 lon, lat = coords
-                img = self._render_modal_map(marker_lon=lon, marker_lat=lat)
+                html = self._render_modal_map_html(marker_lon=lon, marker_lat=lat)
                 info_html = (
                     f"<div class='target-coord-box'>"
                     f"🎯 {target_name}: <b>{lon:.3f}°E, {lat:.3f}°N</b>"
                     f"</div>"
                 )
-                return img, info_html, float(lon), float(lat)
+                return html, info_html, float(lon), float(lat)
 
             attack_target_radio.change(
                 fn=_on_preset_select,
                 inputs=[attack_target_radio],
-                outputs=[modal_map, target_info_label, modal_target_lon, modal_target_lat],
+                outputs=[modal_map_html, target_info_label, modal_target_lon, modal_target_lat],
             )
 
             def _start_sim_thread(scenario: dict):
