@@ -476,25 +476,32 @@ class TacticalCombatEnv(MultipleCombatEnv_LLM):
                     continue
 
                 if uid in self.reload_pending:
-                    # 기지로 귀환 중
+                    # LLM RTB 명령 — task.go_dest()로 기지 귀환
                     home = self.reload_pending[uid]
-                    all_actions[uid] = _autopilot_hierarchical_action(
-                        sim, home["home_lon"], home["home_lat"])
+                    all_actions[uid] = self.task.go_dest(
+                        self, uid,
+                        dest_lon=home["home_lon"],
+                        dest_lat=home["home_lat"],
+                    )
                 elif uid in self.reloaded_returning:
-                    # 재장착 완료, 교전 지역 복귀 중
+                    # 재장착 완료, 교전 지역 복귀 중 (오토파일럿 유지)
                     ret = self.reloaded_returning[uid]
                     all_actions[uid] = _autopilot_hierarchical_action(
                         sim, ret["combat_lon"], ret["combat_lat"])
                 elif phase == "approach":
-                    # 적 편대 중심으로 접근
+                    # 적 편대 중심으로 접근 (오토파일럿 유지)
                     tgt_lon, tgt_lat = self._formation_centroid(enemy_uids)
                     all_actions[uid] = _autopilot_hierarchical_action(
                         sim, tgt_lon, tgt_lat)
-                elif phase in ("rtb_loss",):
-                    # 기지 복귀
+                elif phase in ("rtb_loss", "rtb_victory"):
+                    # LLM RTB 명령 — task.go_dest()로 기지 귀환
                     base = pair["friendly_base"]
-                    all_actions[uid] = _autopilot_hierarchical_action(
-                        sim, base["lon"], base["lat"], target_alt_m=5000.0)
+                    all_actions[uid] = self.task.go_dest(
+                        self, uid,
+                        dest_lon=base["lon"],
+                        dest_lat=base["lat"],
+                        target_alt_m=5000.0,
+                    )
                 elif phase == "support":
                     # 지원 요청 → 기존 잔존 기체는 계속 전투 (RL)
                     all_actions[uid] = self._rl_action_ego(uid)
