@@ -433,10 +433,9 @@ class TacticalDashboard:
     ) -> np.ndarray:
         """
         시나리오 모달용 지도를 numpy RGB 배열로 렌더링.
-        marker_lon/lat 가 주어지면 황색 ★ 마커를 표시.
-        bbox_inches='tight' 없이 저장 → 정확히 figsize*dpi 픽셀 (630×540).
+        fig.savefig → PIL 경로를 사용해 Gradio 스레드 환경에서도 안정적으로 동작.
         """
-        fig = self._make_map_figure()   # self._map_axes_frac 도 갱신됨
+        fig = self._make_map_figure()   # self._map_axes_frac 갱신
         ax = fig.axes[0]
 
         if marker_lon is not None and marker_lat is not None:
@@ -446,20 +445,22 @@ class TacticalDashboard:
                 markeredgecolor="#1e1e2e", markeredgewidth=1.5,
                 zorder=15,
             )
-            # 십자선 보조 마커
             ax.plot(
                 marker_lon, marker_lat, "+",
                 color="white", markersize=16,
                 markeredgewidth=2.0, zorder=16,
             )
 
-        fig.canvas.draw()
-        w, h = fig.canvas.get_width_height()
-        self._modal_img_wh = (w, h)
-        img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
-        img_rgb = img[:, :, :3].copy()
+        buf = io.BytesIO()
+        # bbox_inches 지정 안 함 → 정확히 figsize*dpi 픽셀 (630×540)
+        fig.savefig(buf, format="png", facecolor="#1e1e2e", dpi=90)
         plt.close(fig)
-        return img_rgb
+        buf.seek(0)
+
+        from PIL import Image as _PILImage
+        pil_img = _PILImage.open(buf).convert("RGB")
+        self._modal_img_wh = pil_img.size   # (width, height)
+        return np.array(pil_img)
 
     def _px_to_lonlat(
         self, px: int, py: int
@@ -1176,11 +1177,25 @@ class TacticalDashboard:
           margin: 6px 0; text-align: center;
         }
         /* 모달 지도 이미지 — 클릭 커서 */
-        #modal-map-img img,
-        #modal-map-img .svelte-1pijsyv { cursor: crosshair !important; }
-        /* Gradio Image 업로드 버튼 숨김 (클릭 전용 모드) */
-        #modal-map-img .upload-container,
-        #modal-map-img .source-selection { display: none !important; }
+        #modal-map-img img { cursor: crosshair !important; }
+        /* 모달 내 Gradio 컴포넌트 배경 투명화 + 텍스트 강제 표시 */
+        #scenario-modal-inner .block,
+        #scenario-modal-inner .form,
+        #scenario-modal-inner fieldset {
+          background: transparent !important;
+          border-color: #45475a !important;
+        }
+        #scenario-modal-inner label,
+        #scenario-modal-inner .wrap span,
+        #scenario-modal-inner .svelte-s1r2yt,
+        #scenario-modal-inner input[type="checkbox"] + span,
+        #scenario-modal-inner input[type="radio"]    + span {
+          color: #cdd6f4 !important;
+        }
+        #scenario-modal-inner input[type="checkbox"],
+        #scenario-modal-inner input[type="radio"] {
+          accent-color: #89b4fa;
+        }
         .scenario-title {
           font-size:1.1rem; font-weight:700;
           color:#89b4fa; margin-bottom:16px;
@@ -1445,10 +1460,12 @@ class TacticalDashboard:
                         "</div>"
                     )
                     # 클릭 가능한 지도 이미지
+                    # value를 빌드 시점에 렌더링 → 모달 열릴 때 즉시 표시
+                    # interactive=False → 업로드 UI 없이 이미지만 표시 (.select() 는 동작)
                     modal_map = gr.Image(
-                        value=None,
+                        value=self._render_modal_map(),
                         type="numpy",
-                        interactive=True,
+                        interactive=False,
                         height=380,
                         show_label=False,
                         show_download_button=False,
