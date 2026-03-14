@@ -1295,13 +1295,21 @@ class TacticalDashboard:
           font-size: 0.85rem; color: #f9e2af;
           margin: 6px 0; text-align: center;
         }
-        /* JS→Python 브릿지 textbox: DOM 에 존재하되 화면 밖 배치 */
+        /* JS→Python 브릿지 textbox: DOM 에 존재하되 화면 밖 배치 (ID 선택자로 확실히 숨김) */
+        #base-action-tb,
+        #modal-map-click-tb {
+          position: fixed !important;
+          left: -9999px !important; top: -9999px !important;
+          width: 0 !important; height: 0 !important;
+          overflow: hidden !important; opacity: 0 !important;
+          pointer-events: none !important; visibility: hidden !important;
+        }
         .modal-click-hidden {
           position: fixed !important;
           left: -9999px !important; top: -9999px !important;
-          width: 1px !important; height: 1px !important;
+          width: 0 !important; height: 0 !important;
           overflow: hidden !important; opacity: 0 !important;
-          pointer-events: none !important;
+          pointer-events: none !important; visibility: hidden !important;
         }
         /* 모달 HTML 지도 컨테이너 */
         #modal-map-html { display: block; }
