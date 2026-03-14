@@ -1337,6 +1337,19 @@ class TacticalDashboard:
         .scenario-title {
           font-size:1.1rem; font-weight:700;
           color:#89b4fa; margin-bottom:16px;
+          position: sticky !important;
+          top: -24px !important;
+          z-index: 20 !important;
+          background: #2a2a3e !important;
+          padding: 16px 0 8px 0 !important;
+          margin-top: -16px !important;
+        }
+        #current-base-label {
+          position: sticky !important;
+          top: 30px !important;
+          z-index: 19 !important;
+          background: #2a2a3e !important;
+          padding: 4px 0 !important;
         }
         #confirm-scenario-btn {
           background:#a6e3a1 !important; color:#1e1e2e !important;
