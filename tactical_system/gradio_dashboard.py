@@ -142,7 +142,11 @@ class TacticalDashboard:
         self._modal_img_wh: Tuple[int, int] = (630, 540)  # dpi=90, figsize=(7,6)
 
     def _get_sim_id(self) -> Optional[int]:
-        """명시 sim_id가 있으면 그것을, 없으면 DB에서 최신 sim_id를 반환."""
+        """시뮬레이션이 시작된 이후에만 sim_id를 반환한다.
+        서버 재시작 시 이전 시뮬레이션 데이터가 표시되지 않도록
+        _sim_started 가 True 일 때만 DB 조회를 허용한다."""
+        if not self._sim_started and self._explicit_sim_id is None:
+            return None
         if self._explicit_sim_id is not None:
             return self._explicit_sim_id
         sid = self.db.get_latest_sim_id()
