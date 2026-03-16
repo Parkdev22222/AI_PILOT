@@ -137,9 +137,26 @@ class TacticalDashboard:
         self.refresh_interval = refresh_interval
         self.start_callback = start_callback
         self._sim_started = False
+        self._sim_completed = False  # 시뮬레이션 완료 여부
         # 모달 지도 좌표 변환용: tight_layout 후 axes 위치 (figure fraction)
         self._map_axes_frac: Tuple[float, float, float, float] = (0.12, 0.10, 0.96, 0.94)
         self._modal_img_wh: Tuple[int, int] = (630, 540)  # dpi=90, figsize=(7,6)
+
+    def _is_sim_completed(self) -> bool:
+        """현재 sim_id 의 DB 상태가 'completed' 인지 확인."""
+        sid = self._explicit_sim_id
+        if sid is None:
+            return False
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self.db.db_path)
+            row = conn.execute(
+                "SELECT status FROM simulation_info WHERE sim_id=?", (sid,)
+            ).fetchone()
+            conn.close()
+            return row is not None and row[0] == "completed"
+        except Exception:
+            return False
 
     def _get_sim_id(self) -> Optional[int]:
         """시뮬레이션이 시작된 이후에만 sim_id를 반환한다.
@@ -1110,9 +1127,20 @@ class TacticalDashboard:
     # ------------------------------------------------------------------
 
     def _refresh(self):
+        # 시뮬레이션 완료 감지 → 버튼 재활성화
+        if self._sim_started and not self._sim_completed and self._is_sim_completed():
+            self._sim_completed = True
+            btn_upd  = gr.update(value="▶ 시뮬레이션 시작", interactive=True)
+            scen_upd = gr.update(interactive=True)
+        else:
+            btn_upd  = gr.update()
+            scen_upd = gr.update()
+
         return (
             self._make_map_carrier(),   # map-carrier → JS가 img.src 업데이트
             self._make_data_payload(),  # data-carrier → JS가 상태패널 업데이트
+            btn_upd,                    # start_btn
+            scen_upd,                   # scenario_btn
         )
 
     # ------------------------------------------------------------------
@@ -1678,24 +1706,28 @@ class TacticalDashboard:
             timer = gr.Timer(value=self.refresh_interval)
             timer.tick(
                 fn=self._refresh,
-                outputs=[map_carrier, data_carrier],
+                outputs=[map_carrier, data_carrier, start_btn, scenario_btn],
             )
 
             # ── 시나리오 버튼 콜백 ────────────────────────────────────────
 
             def _start_sim_thread(scenario: dict):
-                """시뮬레이션 스레드 시작 (중복 방지)."""
-                if not self._sim_started:
-                    self._sim_started = True
-                    if self.start_callback:
-                        import threading
-                        t = threading.Thread(
-                            target=self.start_callback,
-                            args=(scenario,),
-                            daemon=True,
-                            name="SimThread",
-                        )
-                        t.start()
+                """시뮬레이션 스레드 시작 (재실행 지원: 이전 상태 초기화 후 시작)."""
+                # 이전 시뮬레이션 상태 리셋 (지도·패널이 새 sim 기준으로 갱신되도록)
+                self._sim_started = False
+                self._explicit_sim_id = None
+                self._sim_completed = False
+
+                self._sim_started = True
+                if self.start_callback:
+                    import threading
+                    t = threading.Thread(
+                        target=self.start_callback,
+                        args=(scenario,),
+                        daemon=True,
+                        name="SimThread",
+                    )
+                    t.start()
 
             # 모달 열기
             def _on_open_scenario():
@@ -1813,20 +1845,28 @@ class TacticalDashboard:
                     gr.update(visible=False),
                     label_html,
                     gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False),
+                    gr.update(interactive=False),
                 )
 
             confirm_btn.click(
                 fn=_on_confirm_and_start,
                 inputs=[bases_state],
-                outputs=[scenario_state, scenario_modal, scenario_label, start_btn],
+                outputs=[scenario_state, scenario_modal, scenario_label, start_btn, scenario_btn],
             )
 
             # ── 메인 시뮬레이션 시작 버튼 (시나리오 미설정 시 기본값으로 시작) ────
             def _on_start_click(scenario):
                 _start_sim_thread(scenario or {})
-                return gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False)
+                return (
+                    gr.update(value="⏳ 시뮬레이션 실행 중...", interactive=False),
+                    gr.update(interactive=False),
+                )
 
-            start_btn.click(fn=_on_start_click, inputs=[scenario_state], outputs=[start_btn])
+            start_btn.click(
+                fn=_on_start_click,
+                inputs=[scenario_state],
+                outputs=[start_btn, scenario_btn],
+            )
 
         return demo
 

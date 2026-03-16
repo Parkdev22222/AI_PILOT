@@ -130,12 +130,16 @@ def main():
             print(f"  편대쌍 수     : {len(controller.formation_pairs)}")
             print(f"  DB 경로       : {args.db_path}\n")
 
-            # 대시보드가 새 sim_id 를 자동 발견하도록 초기화
+            # 대시보드에 새 sim_id 주입 (이전 sim_id 덮어쓰기)
             dashboard._explicit_sim_id = controller.sim_id
 
             controller.run()
+
+            # 시뮬레이션 완료 — 대시보드 완료 플래그는 _refresh()가 DB 조회로 감지
         except Exception as exc:
             logger.error(f"시뮬레이션 오류: {exc}", exc_info=True)
+            # 오류 발생 시에도 버튼이 복구되도록 완료 상태로 설정
+            dashboard._sim_completed = True
 
     dashboard.start_callback = _start_simulation
 
